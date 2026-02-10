@@ -7,21 +7,21 @@ Nexus is a WhatsApp-first AI assistant with a Python core and a Node bridge.
 ### From source (development)
 
 ```bash
-git clone https://github.com/<your-org>/nexus.git
-cd nexus
+git clone https://github.com/liamdatt/NEXUS.git
+cd NEXUS
 pip install -e .
 ```
 
 ### With uv tool (global install)
 
 ```bash
-uv tool install nexus-ai
+uv tool install flopro-nexus
 ```
 
 ### From PyPI
 
 ```bash
-pip install nexus-ai
+pip install flopro-nexus
 ```
 
 ## Quick Start
