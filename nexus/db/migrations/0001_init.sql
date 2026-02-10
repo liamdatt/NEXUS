@@ -1,0 +1,2 @@
+-- Initial schema is created programmatically in nexus/db/models.py.
+-- Keep this file as documentation placeholder for future managed migrations.
