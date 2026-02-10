@@ -37,9 +37,9 @@ class Settings(BaseSettings):
     bridge_ws_url: str = "ws://127.0.0.1:8765"
     bridge_shared_secret: str = ""
 
-    llm_primary_model: str = "openrouter/openai/gpt-4o-mini"
-    llm_complex_model: str = "openrouter/openai/gpt-4.1"
-    llm_fallback_model: str = "openrouter/anthropic/claude-3.5-sonnet"
+    llm_primary_model: str = "google/gemini-3-flash-preview"
+    llm_complex_model: str = "google/gemini-3-flash-preview"
+    llm_fallback_model: str = "google/gemini-3-flash-preview"
     llm_max_tokens: int = 1200
     llm_timeout_seconds: int = 45
 
