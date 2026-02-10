@@ -98,6 +98,7 @@ const bridge = new WhatsAppBridge({
     broadcast("bridge.error", { error });
   },
   onConnected: () => {
+    broadcast("bridge.connected", { status: "connected" });
     if (exitOnConnect && !exitScheduled) {
       exitScheduled = true;
       console.log(
@@ -107,6 +108,9 @@ const bridge = new WhatsAppBridge({
         void shutdown(0);
       }, exitOnConnectDelayMs);
     }
+  },
+  onDisconnected: (reason: string) => {
+    broadcast("bridge.disconnected", { reason });
   },
 });
 

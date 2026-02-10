@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     memories_dir: Path | None = None
 
     bridge_ws_url: str = "ws://127.0.0.1:8765"
+    bridge_bind_host: str | None = None
     bridge_shared_secret: str = ""
 
     llm_primary_model: str = "google/gemini-3-flash-preview"

@@ -14,6 +14,7 @@ type OnInbound = (payload: InboundPayload) => void;
 type OnQR = (qr: string) => void;
 type OnError = (msg: string) => void;
 type OnConnected = () => void;
+type OnDisconnected = (reason: string) => void;
 
 const logger = pino({ level: process.env.BRIDGE_LOG_LEVEL ?? "silent" });
 
@@ -86,6 +87,7 @@ export class WhatsAppBridge {
   private readonly onQR: OnQR;
   private readonly onError: OnError;
   private readonly onConnected?: OnConnected;
+  private readonly onDisconnected?: OnDisconnected;
   private reconnecting = false;
   private allowReconnect = true;
   /** Track our own outbound message IDs to suppress echo */
@@ -101,12 +103,14 @@ export class WhatsAppBridge {
     onQR: OnQR;
     onError: OnError;
     onConnected?: OnConnected;
+    onDisconnected?: OnDisconnected;
   }) {
     this.sessionDir = opts.sessionDir;
     this.onInbound = opts.onInbound;
     this.onQR = opts.onQR;
     this.onError = opts.onError;
     this.onConnected = opts.onConnected;
+    this.onDisconnected = opts.onDisconnected;
   }
 
   async start(): Promise<void> {
@@ -154,6 +158,7 @@ export class WhatsAppBridge {
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
+        this.onDisconnected?.(loggedOut ? "logged_out" : "connection_closed");
         if (this.allowReconnect && !loggedOut && !this.reconnecting) {
           this.reconnecting = true;
           console.log("[bridge] Connection closed, reconnecting in 5s...");

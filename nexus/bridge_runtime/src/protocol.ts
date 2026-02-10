@@ -1,6 +1,8 @@
 export type BridgeEvent =
   | "bridge.ready"
   | "bridge.qr"
+  | "bridge.connected"
+  | "bridge.disconnected"
   | "bridge.inbound_message"
   | "bridge.delivery_receipt"
   | "bridge.error"

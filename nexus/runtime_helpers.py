@@ -171,8 +171,9 @@ def build_bridge_env(
     exit_on_connect_delay_ms: int | None = None,
 ) -> dict[str, str]:
     host, port = parse_bridge_target(settings.bridge_ws_url)
+    bind_host = settings.bridge_bind_host or host
     env = dict(os.environ)
-    env["BRIDGE_HOST"] = host
+    env["BRIDGE_HOST"] = bind_host
     env["BRIDGE_PORT"] = str(port)
     env["BRIDGE_SHARED_SECRET"] = settings.bridge_shared_secret
     env["BRIDGE_QR_MODE"] = qr_mode
