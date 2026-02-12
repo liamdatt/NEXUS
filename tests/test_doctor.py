@@ -20,6 +20,8 @@ def _bridge_dir(path: Path) -> Path:
     (path / "src").mkdir(parents=True, exist_ok=True)
     (path / "package.json").write_text('{"name":"bridge"}\n', encoding="utf-8")
     (path / "src" / "server.ts").write_text("console.log('ok')\n", encoding="utf-8")
+    (path / "node_modules" / ".bin").mkdir(parents=True, exist_ok=True)
+    (path / "node_modules" / ".bin" / "tsx").write_text("#!/usr/bin/env node\n", encoding="utf-8")
     return path
 
 

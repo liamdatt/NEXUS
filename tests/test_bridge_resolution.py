@@ -34,6 +34,8 @@ def test_prepare_bridge_runtime_copies_packaged_assets(monkeypatch, tmp_path: Pa
     (template / "src").mkdir(parents=True)
     (template / "package.json").write_text('{"name":"bridge"}\n', encoding="utf-8")
     (template / "src" / "server.ts").write_text("console.log('ok')\n", encoding="utf-8")
+    (template / "node_modules" / ".bin").mkdir(parents=True)
+    (template / "node_modules" / ".bin" / "tsx").write_text("#!/usr/bin/env node\n", encoding="utf-8")
 
     monkeypatch.setattr(runtime_helpers, "_bridge_runtime_template_dir", lambda: template)
 

@@ -28,6 +28,7 @@ class _FakeProcess:
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
+        _env_file=None,
         db_path=tmp_path / "nexus.db",
         workspace=tmp_path / "workspace",
         memories_dir=tmp_path / "memories",

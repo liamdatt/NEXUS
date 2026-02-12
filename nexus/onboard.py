@@ -10,7 +10,7 @@ from typing import Any
 from nexus.config import Settings
 from nexus.integrations.google_auth import google_auth_status
 from nexus.runtime_helpers import (
-    bridge_runtime_ready,
+    bridge_runtime_dependencies_ready,
     ensure_bridge_runtime_dir,
     is_bridge_running,
     parse_bridge_target,
@@ -103,9 +103,13 @@ def run_onboard(settings: Settings, *, non_interactive: bool = False, assume_yes
     print(f"[nexus] wrote config: {env_path}")
 
     try:
-        subprocess.run(["npm", "install"], cwd=str(bridge_dir), check=True)
+        subprocess.run(["npm", "install", "--include=dev"], cwd=str(bridge_dir), check=True)
     except subprocess.CalledProcessError as exc:
         print(f"[nexus] bridge dependency install failed: {exc}")
+        return 1
+
+    if not bridge_runtime_dependencies_ready(bridge_dir):
+        print("[nexus] bridge runtime is missing required dependencies after install (tsx not found).")
         return 1
 
     try:
@@ -165,7 +169,7 @@ def collect_doctor_status(settings: Settings) -> dict[str, Any]:
         "workspace": str(settings.workspace),
         "bridge_dir": str(bridge_dir),
         "bridge_dir_exists": bridge_dir.exists(),
-        "bridge_runtime_ready": bridge_runtime_ready(bridge_dir),
+        "bridge_runtime_ready": bridge_runtime_dependencies_ready(bridge_dir),
         "npm_on_path": npm_on_path,
         "openrouter_api_key_set": bool(settings.openrouter_api_key),
         "brave_api_key_set": bool(settings.brave_api_key),

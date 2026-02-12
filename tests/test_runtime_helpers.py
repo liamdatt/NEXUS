@@ -48,6 +48,20 @@ def test_resolve_session_dir_prefers_cli_value_then_bridge_env(tmp_path: Path):
     assert from_env == (bridge_dir / "state" / "wa").resolve()
 
 
+def test_bridge_runtime_dependencies_ready_requires_tsx(tmp_path: Path):
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "src").mkdir(parents=True)
+    (bridge_dir / "package.json").write_text('{"name":"bridge"}\n', encoding="utf-8")
+    (bridge_dir / "src" / "server.ts").write_text("console.log('ok')\n", encoding="utf-8")
+
+    assert runtime_helpers.bridge_runtime_ready(bridge_dir)
+    assert not runtime_helpers.bridge_runtime_dependencies_ready(bridge_dir)
+
+    (bridge_dir / "node_modules" / ".bin").mkdir(parents=True)
+    (bridge_dir / "node_modules" / ".bin" / "tsx").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    assert runtime_helpers.bridge_runtime_dependencies_ready(bridge_dir)
+
+
 def test_is_bridge_running_uses_socket_probe(monkeypatch):
     class _DummyConn:
         def __enter__(self):

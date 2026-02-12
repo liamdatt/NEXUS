@@ -88,10 +88,21 @@ def resolve_bridge_dir(settings: Settings) -> Path:
     return (settings.data_dir / "bridge").resolve()
 
 
+def bridge_runtime_has_tsx(bridge_dir: Path) -> bool:
+    local_bin = bridge_dir / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
+    if local_bin.exists():
+        return True
+    return shutil.which("tsx") is not None
+
+
 def bridge_runtime_ready(bridge_dir: Path) -> bool:
     package_json = bridge_dir / "package.json"
     server_ts = bridge_dir / "src" / "server.ts"
     return package_json.exists() and server_ts.exists()
+
+
+def bridge_runtime_dependencies_ready(bridge_dir: Path) -> bool:
+    return bridge_runtime_ready(bridge_dir) and bridge_runtime_has_tsx(bridge_dir)
 
 
 def prepare_bridge_runtime(
