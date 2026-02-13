@@ -3,6 +3,7 @@ export type BridgeEvent =
   | "bridge.qr"
   | "bridge.connected"
   | "bridge.disconnected"
+  | "bridge.connection_update"
   | "bridge.inbound_message"
   | "bridge.delivery_receipt"
   | "bridge.error"
@@ -56,5 +57,14 @@ export interface DeliveryPayload {
   outbound_id: string;
   provider_message_id: string;
   chat_id: string;
+  timestamp: string;
+}
+
+export interface ConnectionUpdatePayload {
+  connection: string;
+  has_qr: boolean;
+  status_code?: number;
+  logged_out: boolean;
+  reconnect_scheduled: boolean;
   timestamp: string;
 }

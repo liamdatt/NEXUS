@@ -32,7 +32,7 @@ class BridgeClient:
 
     async def run_forever(self) -> None:
         self._running = True
-        headers = {}
+        headers = {"x-nexus-client": "core"}
         if self.settings.bridge_shared_secret:
             headers["x-nexus-secret"] = self.settings.bridge_shared_secret
 
@@ -41,7 +41,7 @@ class BridgeClient:
             try:
                 async with websockets.connect(
                     self.settings.bridge_ws_url,
-                    additional_headers=headers or None,
+                    additional_headers=headers,
                 ) as ws:
                     self._ws = ws
                     logger.info("BridgeClient connected to bridge")
@@ -106,6 +106,33 @@ class BridgeClient:
                 chat_id = str(payload.get("chat_id", ""))
                 if self.on_delivery and provider_message_id and chat_id:
                     self.on_delivery(provider_message_id, chat_id)
+        elif event == "bridge.qr":
+            logger.info("BridgeClient received bridge.qr")
+        elif event == "bridge.connected":
+            logger.info("BridgeClient received bridge.connected")
+        elif event == "bridge.disconnected":
+            reason = payload_obj.get("reason") if isinstance(payload_obj, dict) else None
+            logger.info("BridgeClient received bridge.disconnected reason=%s", reason)
+        elif event == "bridge.error":
+            error = payload_obj.get("error") if isinstance(payload_obj, dict) else payload_obj
+            logger.warning("BridgeClient reported bridge.error: %s", error)
+        elif event == "bridge.connection_update":
+            payloads = payload_obj if isinstance(payload_obj, list) else [payload_obj]
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    logger.warning(
+                        "BridgeClient ignored connection_update payload type=%s",
+                        type(payload).__name__,
+                    )
+                    continue
+                logger.info(
+                    "BridgeClient connection update: connection=%s has_qr=%s status_code=%s logged_out=%s reconnect_scheduled=%s",
+                    payload.get("connection"),
+                    payload.get("has_qr"),
+                    payload.get("status_code"),
+                    payload.get("logged_out"),
+                    payload.get("reconnect_scheduled"),
+                )
 
     async def send_outbound(self, message: OutboundMessage) -> None:
         if not self._ws:

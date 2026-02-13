@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from nexus.channels.ws_client import BridgeClient
@@ -50,7 +51,10 @@ def test_bridge_client_uses_additional_headers(monkeypatch, tmp_path: Path):
     asyncio.run(client.run_forever())
 
     assert seen["url"] == "ws://127.0.0.1:8765"
-    assert seen["kwargs"]["additional_headers"] == {"x-nexus-secret": "change-me"}
+    assert seen["kwargs"]["additional_headers"] == {
+        "x-nexus-client": "core",
+        "x-nexus-secret": "change-me",
+    }
 
 
 def test_bridge_client_handles_list_payload_without_crash(tmp_path: Path):
@@ -105,3 +109,83 @@ def test_bridge_client_handles_list_payload_without_crash(tmp_path: Path):
     asyncio.run(client._handle_message(delivery_env))
 
     assert seen == {"inbound": 1, "deliveries": 1}
+
+
+def test_bridge_client_handles_bridge_diagnostic_events_without_crash(tmp_path: Path, caplog):
+    settings = Settings(
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+    )
+
+    client = BridgeClient(settings=settings, on_inbound=_on_inbound)
+
+    events = [
+        json.dumps(
+            {
+                "event": "bridge.connection_update",
+                "message_id": "m1",
+                "timestamp": "2026-02-13T00:00:00Z",
+                "channel": "whatsapp",
+                "trace_id": "t1",
+                "payload": {
+                    "connection": "close",
+                    "has_qr": False,
+                    "status_code": 428,
+                    "logged_out": False,
+                    "reconnect_scheduled": True,
+                    "timestamp": "2026-02-13T00:00:00Z",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event": "bridge.qr",
+                "message_id": "m2",
+                "timestamp": "2026-02-13T00:00:00Z",
+                "channel": "whatsapp",
+                "trace_id": "t2",
+                "payload": {"qr": "abc"},
+            }
+        ),
+        json.dumps(
+            {
+                "event": "bridge.connected",
+                "message_id": "m3",
+                "timestamp": "2026-02-13T00:00:00Z",
+                "channel": "whatsapp",
+                "trace_id": "t3",
+                "payload": {"status": "connected"},
+            }
+        ),
+        json.dumps(
+            {
+                "event": "bridge.disconnected",
+                "message_id": "m4",
+                "timestamp": "2026-02-13T00:00:00Z",
+                "channel": "whatsapp",
+                "trace_id": "t4",
+                "payload": {"reason": "connection_closed"},
+            }
+        ),
+        json.dumps(
+            {
+                "event": "bridge.error",
+                "message_id": "m5",
+                "timestamp": "2026-02-13T00:00:00Z",
+                "channel": "whatsapp",
+                "trace_id": "t5",
+                "payload": {"error": "pairing_timeout_waiting_for_qr"},
+            }
+        ),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        for env in events:
+            asyncio.run(client._handle_message(env))
+
+    assert "BridgeClient connection update:" in caplog.text
+    assert "BridgeClient received bridge.qr" in caplog.text
+    assert "BridgeClient received bridge.connected" in caplog.text
+    assert "BridgeClient received bridge.disconnected" in caplog.text
+    assert "pairing_timeout_waiting_for_qr" in caplog.text

@@ -2,7 +2,7 @@ import "dotenv/config";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import qrcode from "qrcode-terminal";
-import { Envelope, InboundPayload, OutboundPayload } from "./protocol.js";
+import { ConnectionUpdatePayload, Envelope, InboundPayload, OutboundPayload } from "./protocol.js";
 import { WhatsAppBridge } from "./whatsapp.js";
 
 const host = process.env.BRIDGE_HOST ?? "0.0.0.0";
@@ -36,6 +36,13 @@ function broadcast<T>(event: Envelope["event"], payload: T): void {
       ws.send(msg);
     }
   }
+}
+
+function parseClientName(header: string | string[] | undefined): string {
+  if (Array.isArray(header)) {
+    return (header[0] ?? "").trim() || "unknown";
+  }
+  return (header ?? "").trim() || "unknown";
 }
 
 const wss = new WebSocketServer({
@@ -97,7 +104,11 @@ const bridge = new WhatsAppBridge({
   onError: (error: string) => {
     broadcast("bridge.error", { error });
   },
+  onConnectionUpdate: (payload: ConnectionUpdatePayload) => {
+    broadcast("bridge.connection_update", payload);
+  },
   onConnected: () => {
+    broadcast("bridge.connected", { status: "connected" });
     if (exitOnConnect && !exitScheduled) {
       exitScheduled = true;
       console.log(
@@ -108,11 +119,15 @@ const bridge = new WhatsAppBridge({
       }, exitOnConnectDelayMs);
     }
   },
+  onDisconnected: (reason: string) => {
+    broadcast("bridge.disconnected", { reason });
+  },
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const clientName = parseClientName(req.headers["x-nexus-client"]);
   clients.add(ws);
-  console.log(`[bridge] core ws connected (clients=${clients.size})`);
+  console.log(`[bridge] core ws connected client=${clientName} (clients=${clients.size})`);
   ws.send(JSON.stringify(makeEnvelope("bridge.ready", { status: "ok" })));
 
   ws.on("message", async (raw) => {
@@ -136,7 +151,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     clients.delete(ws);
-    console.log(`[bridge] core ws disconnected (clients=${clients.size})`);
+    console.log(`[bridge] core ws disconnected client=${clientName} (clients=${clients.size})`);
   });
 });
 

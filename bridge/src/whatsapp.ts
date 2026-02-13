@@ -8,14 +8,25 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
-import { DeliveryPayload, InboundPayload, OutboundAttachment, OutboundPayload } from "./protocol.js";
+import {
+  ConnectionUpdatePayload,
+  DeliveryPayload,
+  InboundPayload,
+  OutboundAttachment,
+  OutboundPayload,
+} from "./protocol.js";
 
 type OnInbound = (payload: InboundPayload) => void;
 type OnQR = (qr: string) => void;
 type OnError = (msg: string) => void;
 type OnConnected = () => void;
+type OnDisconnected = (reason: string) => void;
+type OnConnectionUpdate = (payload: ConnectionUpdatePayload) => void;
 
 const logger = pino({ level: process.env.BRIDGE_LOG_LEVEL ?? "silent" });
+const qrTimeoutRaw = Number(process.env.BRIDGE_PAIRING_QR_TIMEOUT_MS ?? "30000");
+const pairingQrTimeoutMs =
+  Number.isFinite(qrTimeoutRaw) && qrTimeoutRaw > 0 ? Math.floor(qrTimeoutRaw) : 30000;
 
 function normalizeJid(jid?: string): string {
   if (!jid) return "";
@@ -86,8 +97,12 @@ export class WhatsAppBridge {
   private readonly onQR: OnQR;
   private readonly onError: OnError;
   private readonly onConnected?: OnConnected;
+  private readonly onDisconnected?: OnDisconnected;
+  private readonly onConnectionUpdate?: OnConnectionUpdate;
   private reconnecting = false;
   private allowReconnect = true;
+  private qrWatchdog?: ReturnType<typeof setTimeout>;
+  private connectAttempt = 0;
   /** Track our own outbound message IDs to suppress echo */
   private readonly recentOutboundIds = new Set<string>();
   /** All known user IDs that belong to "me" (phone number + LID) */
@@ -101,12 +116,16 @@ export class WhatsAppBridge {
     onQR: OnQR;
     onError: OnError;
     onConnected?: OnConnected;
+    onDisconnected?: OnDisconnected;
+    onConnectionUpdate?: OnConnectionUpdate;
   }) {
     this.sessionDir = opts.sessionDir;
     this.onInbound = opts.onInbound;
     this.onQR = opts.onQR;
     this.onError = opts.onError;
     this.onConnected = opts.onConnected;
+    this.onDisconnected = opts.onDisconnected;
+    this.onConnectionUpdate = opts.onConnectionUpdate;
   }
 
   async start(): Promise<void> {
@@ -114,11 +133,41 @@ export class WhatsAppBridge {
     await this.connect();
   }
 
+  private clearQrWatchdog(): void {
+    if (!this.qrWatchdog) {
+      return;
+    }
+    clearTimeout(this.qrWatchdog);
+    this.qrWatchdog = undefined;
+  }
+
+  private closeSocketForRecovery(sock: WASocket): void {
+    try {
+      (sock as any).end?.(undefined);
+    } catch (err) {
+      this.onError(`pairing_timeout_close_failed: ${String(err)}`);
+    }
+  }
+
+  private startQrWatchdog(sock: WASocket, attempt: number): void {
+    this.clearQrWatchdog();
+    this.qrWatchdog = setTimeout(() => {
+      if (!this.allowReconnect) {
+        return;
+      }
+      if (this.sock !== sock || this.connectAttempt !== attempt) {
+        return;
+      }
+      this.onError("pairing_timeout_waiting_for_qr");
+      this.closeSocketForRecovery(sock);
+    }, pairingQrTimeoutMs);
+  }
+
   private async connect(): Promise<void> {
+    const attempt = ++this.connectAttempt;
     const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    // Keep it simple — match the reference working implementation
     const sock = makeWASocket({
       version,
       auth: {
@@ -138,12 +187,28 @@ export class WhatsAppBridge {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", ({ connection, qr, lastDisconnect }) => {
+      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      const reconnectScheduled =
+        connection === "close" && this.allowReconnect && !loggedOut && !this.reconnecting;
+
+      this.onConnectionUpdate?.({
+        connection: connection ?? "unknown",
+        has_qr: Boolean(qr),
+        status_code: typeof statusCode === "number" ? statusCode : undefined,
+        logged_out: loggedOut,
+        reconnect_scheduled: reconnectScheduled,
+        timestamp: new Date().toISOString(),
+      });
+
       if (qr) {
+        this.clearQrWatchdog();
         this.onQR(qr);
       }
+
       if (connection === "open") {
+        this.clearQrWatchdog();
         console.log("[bridge] ✅ Connected to WhatsApp");
-        // Register our phone number as a self-user
         const meUser = jidUser(normalizeJid(sock.user?.id));
         if (meUser) {
           this.selfUsers.add(meUser);
@@ -151,10 +216,11 @@ export class WhatsAppBridge {
         }
         this.onConnected?.();
       }
+
       if (connection === "close") {
-        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        if (this.allowReconnect && !loggedOut && !this.reconnecting) {
+        this.clearQrWatchdog();
+        this.onDisconnected?.(loggedOut ? "logged_out" : "connection_closed");
+        if (reconnectScheduled) {
           this.reconnecting = true;
           console.log("[bridge] Connection closed, reconnecting in 5s...");
           setTimeout(async () => {
@@ -172,11 +238,9 @@ export class WhatsAppBridge {
     sock.ev.on("messages.upsert", (evt: any) => {
       if (evt.type !== "notify") return;
       for (const m of evt.messages ?? []) {
-        // Skip status broadcasts
         if (m.key.remoteJid === "status@broadcast") continue;
         if (!m.key?.remoteJid || !m.key?.id) continue;
 
-        // Skip our own outbound messages (echo suppression)
         if (this.recentOutboundIds.has(m.key.id)) {
           this.recentOutboundIds.delete(m.key.id);
           continue;
@@ -189,20 +253,15 @@ export class WhatsAppBridge {
         const media = extractMedia(message);
         if (!text && !media) continue;
 
-        // Determine self-chat using the selfUsers set
-        let remoteJid = String(m.key.remoteJid);
+        const remoteJid = String(m.key.remoteJid);
         const remoteUser = jidUser(normalizeJid(remoteJid));
 
-        // If this is a fromMe message, learn new self-user IDs (like the LID)
         if (m.key.fromMe && remoteUser && !this.selfUsers.has(remoteUser)) {
           this.selfUsers.add(remoteUser);
           console.log(`[bridge] learned self-user from fromMe: ${remoteUser}`);
         }
 
         const isSelfChat = Boolean(remoteUser && this.selfUsers.has(remoteUser));
-
-        // Use the original remoteJid as chat_id — do NOT rewrite LID to phone number
-        // because the phone's encryption expects the LID for message delivery.
 
         const payload: InboundPayload = {
           id: m.key.id,
@@ -223,10 +282,12 @@ export class WhatsAppBridge {
     });
 
     this.sock = sock;
+    this.startQrWatchdog(sock, attempt);
   }
 
   async stop(): Promise<void> {
     this.allowReconnect = false;
+    this.clearQrWatchdog();
     const sock = this.sock;
     this.sock = undefined;
     this.reconnecting = false;
@@ -266,17 +327,13 @@ export class WhatsAppBridge {
     const result = await this.sock.sendMessage(payload.chat_id, msg as any);
     const providerMessageId = result?.key?.id ?? "";
 
-    // Cache message for retry decryption (getMessage callback)
     if (providerMessageId && result) {
       this.msgCache.set(providerMessageId, result);
-      // Auto-clean after 10 min
       setTimeout(() => this.msgCache.delete(providerMessageId), 10 * 60 * 1000);
     }
 
-    // Track outbound ID so we don't echo it back
     if (providerMessageId) {
       this.recentOutboundIds.add(providerMessageId);
-      // Auto-clean after 5 min
       setTimeout(() => this.recentOutboundIds.delete(providerMessageId), 5 * 60 * 1000);
     }
 
