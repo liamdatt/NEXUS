@@ -12,10 +12,24 @@ from nexus.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REPO_BRIDGE_DIR = REPO_ROOT / "bridge"
+BRIDGE_RUNTIME_TRACKED_FILES = (
+    ".env.example",
+    "package.json",
+    "tsconfig.json",
+    "src/protocol.ts",
+    "src/server.ts",
+    "src/whatsapp.ts",
+)
 
 
 class _TraversableLike(Protocol):
     def is_dir(self) -> bool:
+        ...
+
+    def is_file(self) -> bool:
+        ...
+
+    def joinpath(self, *descendants: str):
         ...
 
     def iterdir(self):
@@ -70,6 +84,27 @@ def _bridge_runtime_template_dir():
     return resources.files("nexus").joinpath("bridge_runtime")
 
 
+def _template_entry(template_dir: _TraversableLike, relative_path: str):
+    node = template_dir
+    for part in Path(relative_path).parts:
+        node = node.joinpath(part)
+    return node
+
+
+def _bridge_runtime_has_drift(template_dir: _TraversableLike, bridge_dir: Path) -> bool:
+    for relative_path in BRIDGE_RUNTIME_TRACKED_FILES:
+        template_entry = _template_entry(template_dir, relative_path)
+        if not template_entry.is_file():
+            raise RuntimeError(f"Packaged bridge runtime asset is missing: {relative_path}")
+
+        target_entry = bridge_dir / relative_path
+        if not target_entry.is_file():
+            return True
+        if target_entry.read_bytes() != template_entry.read_bytes():
+            return True
+    return False
+
+
 def _copy_tree(source: _TraversableLike, destination: Path) -> None:
     if source.is_dir():
         destination.mkdir(parents=True, exist_ok=True)
@@ -112,12 +147,13 @@ def prepare_bridge_runtime(
     overwrite: bool = False,
 ) -> Path:
     bridge_dir = (target_dir or resolve_bridge_dir(settings)).expanduser().resolve()
-    if bridge_runtime_ready(bridge_dir) and not overwrite:
-        return bridge_dir
 
     template_dir = _bridge_runtime_template_dir()
     if not template_dir.is_dir():
         raise RuntimeError("Packaged bridge runtime assets are missing.")
+
+    if bridge_runtime_ready(bridge_dir) and not overwrite and not _bridge_runtime_has_drift(template_dir, bridge_dir):
+        return bridge_dir
 
     if not bridge_dir.exists():
         bridge_dir.mkdir(parents=True, exist_ok=True)
