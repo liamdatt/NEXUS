@@ -70,7 +70,7 @@ def _inbound(msg_id: str, text: str = "run task") -> InboundMessage:
         chat_id="self@lid",
         sender_id="self@lid",
         is_self_chat=True,
-        is_from_me=False,
+        is_from_me=True,
         text=text,
         timestamp=datetime.now(timezone.utc),
     )

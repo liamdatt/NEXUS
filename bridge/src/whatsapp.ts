@@ -256,19 +256,20 @@ export class WhatsAppBridge {
         const remoteJid = String(m.key.remoteJid);
         const remoteUser = jidUser(normalizeJid(remoteJid));
 
-        if (m.key.fromMe && remoteUser && !this.selfUsers.has(remoteUser)) {
-          this.selfUsers.add(remoteUser);
-          console.log(`[bridge] learned self-user from fromMe: ${remoteUser}`);
-        }
-
+        const isFromMe = Boolean(m.key.fromMe);
         const isSelfChat = Boolean(remoteUser && this.selfUsers.has(remoteUser));
+        if (!isSelfChat || !isFromMe) {
+          const reason = !isSelfChat ? "not_self_chat" : "not_from_me";
+          console.log(`[bridge] ignored inbound id=${m.key.id} chat=${remoteJid} reason=${reason}`);
+          continue;
+        }
 
         const payload: InboundPayload = {
           id: m.key.id,
           chat_id: remoteJid,
           sender_id: m.key.participant ?? remoteJid,
           is_self_chat: isSelfChat,
-          is_from_me: Boolean(m.key.fromMe),
+          is_from_me: isFromMe,
           text,
           media,
           timestamp: new Date((Number(m.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),

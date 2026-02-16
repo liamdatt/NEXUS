@@ -58,6 +58,89 @@ def test_whatsapp_non_self_chat_is_ignored(tmp_path: Path):
     assert sent == []
 
 
+def test_whatsapp_self_chat_not_from_me_is_ignored(tmp_path: Path):
+    settings = Settings(
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+        cli_enabled=False,
+    )
+
+    db = Database(settings.db_path)
+    memory = MemoryStore(settings.memories_dir)
+    journals = JournalStore(settings.memories_dir)
+    policy = PolicyEngine(db)
+    tools = ToolRegistry()
+    llm = DummyLLM()
+    loop = NexusLoop(settings, db, memory, journals, tools, policy, llm)
+
+    sent = []
+
+    async def send_whatsapp(msg):
+        sent.append(msg)
+
+    async def send_cli(text):
+        sent.append(text)
+
+    loop.bind_channels(send_whatsapp, send_cli)
+
+    inbound = InboundMessage(
+        id="in-2",
+        channel="whatsapp",
+        chat_id="self@s.whatsapp.net",
+        sender_id="self@s.whatsapp.net",
+        is_self_chat=True,
+        is_from_me=False,
+        text="hello",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    asyncio.run(loop.handle_inbound(inbound, trace_id="trace-2"))
+    assert sent == []
+
+
+def test_whatsapp_self_chat_from_me_is_processed(tmp_path: Path):
+    settings = Settings(
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+        cli_enabled=False,
+    )
+
+    db = Database(settings.db_path)
+    memory = MemoryStore(settings.memories_dir)
+    journals = JournalStore(settings.memories_dir)
+    policy = PolicyEngine(db)
+    tools = ToolRegistry()
+    llm = DummyLLM()
+    loop = NexusLoop(settings, db, memory, journals, tools, policy, llm)
+
+    sent = []
+
+    async def send_whatsapp(msg):
+        sent.append(msg)
+
+    async def send_cli(text):
+        sent.append(text)
+
+    loop.bind_channels(send_whatsapp, send_cli)
+
+    inbound = InboundMessage(
+        id="in-3",
+        channel="whatsapp",
+        chat_id="self@s.whatsapp.net",
+        sender_id="self@s.whatsapp.net",
+        is_self_chat=True,
+        is_from_me=True,
+        text="hello",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    asyncio.run(loop.handle_inbound(inbound, trace_id="trace-3"))
+    assert len(sent) == 1
+    assert getattr(sent[0], "text", "") == "ok"
+
+
 def test_outbound_echo_is_ignored(tmp_path: Path):
     settings = Settings(
         db_path=tmp_path / "nexus.db",

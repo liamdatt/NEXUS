@@ -334,6 +334,13 @@ class NexusLoop:
                 inbound.chat_id,
             )
             return
+        if inbound.channel == "whatsapp" and not inbound.is_from_me:
+            logger.info(
+                "Ignored WA message id=%s chat_id=%s because not from-me",
+                inbound.id,
+                inbound.chat_id,
+            )
+            return
 
         claimed = self.db.claim_ledger(inbound.id, "inbound", inbound.chat_id)
         if not claimed:
