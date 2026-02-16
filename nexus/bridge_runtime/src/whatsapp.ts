@@ -28,20 +28,49 @@ const qrTimeoutRaw = Number(process.env.BRIDGE_PAIRING_QR_TIMEOUT_MS ?? "30000")
 const pairingQrTimeoutMs =
   Number.isFinite(qrTimeoutRaw) && qrTimeoutRaw > 0 ? Math.floor(qrTimeoutRaw) : 30000;
 
-function normalizeJid(jid?: string): string {
-  if (!jid) return "";
-  if (jid.includes("@")) {
-    const [userWithDevice, domain] = jid.split("@");
-    const user = userWithDevice.split(":")[0];
-    return `${user}@${domain}`;
+function normalizeJid(raw?: unknown): string {
+  if (typeof raw !== "string") {
+    return "";
   }
-  return jid;
+  const jid = raw.trim();
+  if (!jid) {
+    return "";
+  }
+  if (!jid.includes("@")) {
+    return jid.split(":")[0] ?? "";
+  }
+  const [userWithDevice, domainRaw] = jid.split("@", 2);
+  const user = userWithDevice.split(":")[0] ?? "";
+  const domain = (domainRaw ?? "").toLowerCase();
+  if (!user || !domain) {
+    return "";
+  }
+  return `${user}@${domain}`;
 }
 
-function jidUser(jid?: string): string {
-  if (!jid) return "";
-  const base = jid.includes("@") ? jid.split("@")[0] : jid;
-  return base.split(":")[0] ?? "";
+function jidUser(raw?: unknown): string {
+  const normalized = normalizeJid(raw);
+  if (!normalized) {
+    return "";
+  }
+  if (!normalized.includes("@")) {
+    return normalized;
+  }
+  return normalized.split("@", 1)[0] ?? "";
+}
+
+function uniqueJids(...values: unknown[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeJid(value);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
 }
 
 function extractText(msg: any): string | undefined {
@@ -105,8 +134,10 @@ export class WhatsAppBridge {
   private connectAttempt = 0;
   /** Track our own outbound message IDs to suppress echo */
   private readonly recentOutboundIds = new Set<string>();
-  /** All known user IDs that belong to "me" (phone number + LID) */
+  /** All known user IDs that belong to "me" (phone number + LID aliases). */
   private readonly selfUsers = new Set<string>();
+  /** Known full JID aliases for "me". */
+  private readonly selfJids = new Set<string>();
   /** Cache sent messages for retry decryption (getMessage callback) */
   private readonly msgCache = new Map<string, any>();
 
@@ -158,9 +189,60 @@ export class WhatsAppBridge {
       if (this.sock !== sock || this.connectAttempt !== attempt) {
         return;
       }
-      this.onError("pairing_timeout_waiting_for_qr");
+      console.log("[bridge] pairing watchdog timeout; recycling socket while remaining in pending_pairing");
       this.closeSocketForRecovery(sock);
     }, pairingQrTimeoutMs);
+  }
+
+  private registerSelfIdentity(raw: unknown, source: string): void {
+    const normalized = normalizeJid(raw);
+    if (!normalized) {
+      return;
+    }
+
+    let changed = false;
+    if (normalized.includes("@") && !this.selfJids.has(normalized)) {
+      this.selfJids.add(normalized);
+      changed = true;
+    }
+
+    const user = jidUser(normalized);
+    if (user && !this.selfUsers.has(user)) {
+      this.selfUsers.add(user);
+      changed = true;
+    }
+
+    if (changed) {
+      console.log(`[bridge] registered self identity source=${source} jid=${normalized} user=${user || "-"}`);
+    }
+  }
+
+  private seedSelfIdentities(sock: WASocket, authState: any): void {
+    const user = (sock.user ?? {}) as Record<string, unknown>;
+    this.registerSelfIdentity(user.id, "sock.user.id");
+    this.registerSelfIdentity(user.jid, "sock.user.jid");
+    this.registerSelfIdentity(user.lid, "sock.user.lid");
+
+    const credsMe = authState?.creds?.me;
+    if (credsMe && typeof credsMe === "object") {
+      this.registerSelfIdentity((credsMe as Record<string, unknown>).id, "creds.me.id");
+      this.registerSelfIdentity((credsMe as Record<string, unknown>).jid, "creds.me.jid");
+      this.registerSelfIdentity((credsMe as Record<string, unknown>).lid, "creds.me.lid");
+    } else {
+      this.registerSelfIdentity(credsMe, "creds.me");
+    }
+  }
+
+  private isKnownSelfJid(raw: unknown): boolean {
+    const normalized = normalizeJid(raw);
+    if (!normalized) {
+      return false;
+    }
+    if (this.selfJids.has(normalized)) {
+      return true;
+    }
+    const user = jidUser(normalized);
+    return Boolean(user && this.selfUsers.has(user));
   }
 
   private async connect(): Promise<void> {
@@ -183,6 +265,8 @@ export class WhatsAppBridge {
         return cached?.message ?? undefined;
       },
     });
+
+    this.seedSelfIdentities(sock, state);
 
     sock.ev.on("creds.update", saveCreds);
 
@@ -209,11 +293,7 @@ export class WhatsAppBridge {
       if (connection === "open") {
         this.clearQrWatchdog();
         console.log("[bridge] ✅ Connected to WhatsApp");
-        const meUser = jidUser(normalizeJid(sock.user?.id));
-        if (meUser) {
-          this.selfUsers.add(meUser);
-          console.log(`[bridge] registered self-user: ${meUser}`);
-        }
+        this.seedSelfIdentities(sock, state);
         this.onConnected?.();
       }
 
@@ -253,21 +333,47 @@ export class WhatsAppBridge {
         const media = extractMedia(message);
         if (!text && !media) continue;
 
-        const remoteJid = String(m.key.remoteJid);
-        const remoteUser = jidUser(normalizeJid(remoteJid));
+        const key = m.key as Record<string, unknown>;
+        const remoteJid = String(key.remoteJid);
+        const remoteJidAlt = typeof key.remoteJidAlt === "string" ? key.remoteJidAlt : undefined;
 
-        const isFromMe = Boolean(m.key.fromMe);
-        const isSelfChat = Boolean(remoteUser && this.selfUsers.has(remoteUser));
+        const chatJids = uniqueJids(remoteJid, remoteJidAlt);
+        const chatUsers = Array.from(new Set(chatJids.map((jid) => jidUser(jid)).filter(Boolean)));
+        const matchedChatJids = chatJids.filter((jid) => this.isKnownSelfJid(jid));
+        const matchedChatUsers = chatUsers.filter((user) => this.selfUsers.has(user));
+        const isSelfChat = matchedChatJids.length > 0 || matchedChatUsers.length > 0;
+
+        const participant = typeof key.participant === "string" ? key.participant : undefined;
+        const participantAlt = typeof key.participantAlt === "string" ? key.participantAlt : undefined;
+        const senderJids = uniqueJids(participant, participantAlt);
+        const senderUsers = Array.from(new Set(senderJids.map((jid) => jidUser(jid)).filter(Boolean)));
+
+        const isFromMeRaw = Boolean(key.fromMe);
+        if (isFromMeRaw) {
+          for (const senderJid of senderJids) {
+            this.registerSelfIdentity(senderJid, "sender.from_me");
+          }
+        }
+
+        const senderMatchesSelf =
+          senderJids.some((jid) => this.isKnownSelfJid(jid)) ||
+          senderUsers.some((user) => this.selfUsers.has(user));
+        const hasSenderIdentity = senderJids.length > 0 || senderUsers.length > 0;
+
+        const isFromMe = isFromMeRaw || (isSelfChat && (senderMatchesSelf || !hasSenderIdentity));
+
         if (!isSelfChat || !isFromMe) {
           const reason = !isSelfChat ? "not_self_chat" : "not_from_me";
-          console.log(`[bridge] ignored inbound id=${m.key.id} chat=${remoteJid} reason=${reason}`);
+          console.log(
+            `[bridge] ignored inbound id=${m.key.id} reason=${reason} chat=${remoteJid} chat_alt=${remoteJidAlt ?? "-"} participant=${participant ?? "-"} participant_alt=${participantAlt ?? "-"} from_me_raw=${isFromMeRaw}`
+          );
           continue;
         }
 
         const payload: InboundPayload = {
           id: m.key.id,
           chat_id: remoteJid,
-          sender_id: m.key.participant ?? remoteJid,
+          sender_id: participantAlt ?? participant ?? remoteJidAlt ?? remoteJid,
           is_self_chat: isSelfChat,
           is_from_me: isFromMe,
           text,
@@ -276,7 +382,7 @@ export class WhatsAppBridge {
         };
 
         console.log(
-          `[bridge] inbound id=${payload.id} chat=${payload.chat_id} self=${payload.is_self_chat} fromMe=${payload.is_from_me}`
+          `[bridge] inbound id=${payload.id} chat=${payload.chat_id} sender=${payload.sender_id} self=${payload.is_self_chat} fromMe=${payload.is_from_me}`
         );
         this.onInbound(payload);
       }

@@ -22,6 +22,32 @@ from nexus.tools.base import ToolRegistry, ToolResult
 logger = logging.getLogger(__name__)
 
 
+def _normalize_wa_identity(value: str) -> str:
+    raw = value.strip().lower()
+    if not raw:
+        return ""
+    if "@" not in raw:
+        return raw.split(":", 1)[0]
+    user, domain = raw.split("@", 1)
+    user = user.split(":", 1)[0]
+    return f"{user}@{domain}" if user and domain else ""
+
+
+def _wa_user(value: str) -> str:
+    normalized = _normalize_wa_identity(value)
+    if not normalized:
+        return ""
+    if "@" not in normalized:
+        return normalized
+    return normalized.split("@", 1)[0]
+
+
+def _wa_sender_matches_chat(sender_id: str, chat_id: str) -> bool:
+    sender_user = _wa_user(sender_id)
+    chat_user = _wa_user(chat_id)
+    return bool(sender_user and chat_user and sender_user == chat_user)
+
+
 class NexusLoop:
     def __init__(
         self,
@@ -327,20 +353,28 @@ class NexusLoop:
         )
 
     async def handle_inbound(self, inbound: InboundMessage, trace_id: str) -> None:
-        if inbound.channel == "whatsapp" and not inbound.is_self_chat:
-            logger.info(
-                "Ignored WA message id=%s chat_id=%s because not self-chat",
-                inbound.id,
-                inbound.chat_id,
-            )
-            return
-        if inbound.channel == "whatsapp" and not inbound.is_from_me:
-            logger.info(
-                "Ignored WA message id=%s chat_id=%s because not from-me",
-                inbound.id,
-                inbound.chat_id,
-            )
-            return
+        if inbound.channel == "whatsapp":
+            if not inbound.is_self_chat:
+                logger.info(
+                    "Ignored WA message id=%s chat_id=%s because not self-chat",
+                    inbound.id,
+                    inbound.chat_id,
+                )
+                return
+            if not inbound.is_from_me:
+                if _wa_sender_matches_chat(inbound.sender_id, inbound.chat_id):
+                    logger.info(
+                        "Accepted WA message id=%s chat_id=%s despite from-me=false because sender_id matches chat identity",
+                        inbound.id,
+                        inbound.chat_id,
+                    )
+                else:
+                    logger.info(
+                        "Ignored WA message id=%s chat_id=%s because not from-me and sender_id does not match chat identity",
+                        inbound.id,
+                        inbound.chat_id,
+                    )
+                    return
 
         claimed = self.db.claim_ledger(inbound.id, "inbound", inbound.chat_id)
         if not claimed:
