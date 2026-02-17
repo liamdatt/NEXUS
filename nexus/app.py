@@ -17,9 +17,13 @@ from nexus.memory.journals import JournalStore
 from nexus.memory.store import MemoryStore
 from nexus.tools.base import ToolRegistry
 from nexus.tools.calendar import CalendarTool
+from nexus.tools.contacts import ContactsTool
+from nexus.tools.docs import DocsTool
+from nexus.tools.drive import DriveTool
 from nexus.tools.email import EmailTool
 from nexus.tools.files import FileSystemTool
 from nexus.tools.scheduler import SchedulerTool
+from nexus.tools.sheets import SheetsTool
 from nexus.tools.web import WebTool
 
 
@@ -52,6 +56,10 @@ async def main() -> None:
     tools.register(WebTool(settings))
     tools.register(EmailTool(settings))
     tools.register(CalendarTool(settings))
+    tools.register(DriveTool(settings))
+    tools.register(ContactsTool(settings))
+    tools.register(SheetsTool(settings))
+    tools.register(DocsTool(settings))
 
     loop = NexusLoop(
         settings=settings,

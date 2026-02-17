@@ -36,7 +36,21 @@ class CalendarClient:
             dt = dt.replace(tzinfo=tz)
         return dt.astimezone(tz)
 
-    def create_event(
+    @staticmethod
+    def _calendar_event_out(event: dict[str, Any]) -> dict[str, Any]:
+        start = event.get("start", {}) if isinstance(event, dict) else {}
+        end = event.get("end", {}) if isinstance(event, dict) else {}
+        return {
+            "id": str(event.get("id", "")),
+            "summary": str(event.get("summary", "")),
+            "status": str(event.get("status", "")),
+            "html_link": str(event.get("htmlLink", "")),
+            "start": str(start.get("dateTime") or start.get("date") or ""),
+            "end": str(end.get("dateTime") or end.get("date") or ""),
+            "color_id": str(event.get("colorId", "")),
+        }
+
+    def _event_body(
         self,
         *,
         title: str,
@@ -47,8 +61,8 @@ class CalendarClient:
         location: str | None,
         attendees: list[str] | None,
         timezone_name: str,
+        event_color: str | None = None,
     ) -> dict[str, Any]:
-        service = self._service()
         start_dt = self._to_datetime(start, timezone_name)
         if end is not None:
             end_dt = self._to_datetime(end, timezone_name)
@@ -68,19 +82,150 @@ class CalendarClient:
         clean_attendees = [email.strip() for email in (attendees or []) if email and email.strip()]
         if clean_attendees:
             body["attendees"] = [{"email": email} for email in clean_attendees]
+        if event_color:
+            body["colorId"] = str(event_color).strip()
+        return body
+
+    def list_events(
+        self,
+        *,
+        time_min: str | datetime,
+        time_max: str | datetime,
+        timezone_name: str,
+        max_results: int,
+        query: str | None = None,
+        calendar_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        service = self._service()
+        start = self._to_datetime(time_min, timezone_name)
+        end = self._to_datetime(time_max, timezone_name)
+        listing = (
+            service.events()
+            .list(
+                calendarId=calendar_id or self.settings.google_calendar_id or "primary",
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                q=query or None,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+        out: list[dict[str, Any]] = []
+        for item in listing.get("items", []) or []:
+            out.append(self._calendar_event_out(item))
+        return out
+
+    def create_event(
+        self,
+        *,
+        title: str,
+        start: str | datetime,
+        end: str | datetime | None,
+        duration_minutes: int | None,
+        description: str | None,
+        location: str | None,
+        attendees: list[str] | None,
+        timezone_name: str,
+        event_color: str | None = None,
+        calendar_id: str | None = None,
+    ) -> dict[str, Any]:
+        service = self._service()
+        body = self._event_body(
+            title=title,
+            start=start,
+            end=end,
+            duration_minutes=duration_minutes,
+            description=description,
+            location=location,
+            attendees=attendees,
+            timezone_name=timezone_name,
+            event_color=event_color,
+        )
+        clean_attendees = body.get("attendees", [])
 
         event = (
             service.events()
             .insert(
-                calendarId=self.settings.google_calendar_id or "primary",
+                calendarId=calendar_id or self.settings.google_calendar_id or "primary",
                 body=body,
                 sendUpdates="all" if clean_attendees else "none",
             )
             .execute()
         )
-        return {
-            "id": str(event.get("id", "")),
-            "html_link": str(event.get("htmlLink", "")),
-            "start": str(event.get("start", {}).get("dateTime", "")),
-            "end": str(event.get("end", {}).get("dateTime", "")),
+        return self._calendar_event_out(event)
+
+    def update_event(
+        self,
+        *,
+        event_id: str,
+        calendar_id: str | None = None,
+        title: str | None = None,
+        start: str | datetime | None = None,
+        end: str | datetime | None = None,
+        duration_minutes: int | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        attendees: list[str] | None = None,
+        timezone_name: str,
+        event_color: str | None = None,
+    ) -> dict[str, Any]:
+        service = self._service()
+        resolved_calendar_id = calendar_id or self.settings.google_calendar_id or "primary"
+        existing = service.events().get(calendarId=resolved_calendar_id, eventId=event_id).execute()
+
+        body: dict[str, Any] = {
+            "summary": str(existing.get("summary", "")),
+            "description": str(existing.get("description", "")),
+            "location": str(existing.get("location", "")),
+            "start": existing.get("start", {}),
+            "end": existing.get("end", {}),
         }
+        if "attendees" in existing:
+            body["attendees"] = existing.get("attendees", [])
+        if "colorId" in existing:
+            body["colorId"] = existing.get("colorId")
+
+        if title is not None:
+            body["summary"] = title
+        if description is not None:
+            body["description"] = description
+        if location is not None:
+            body["location"] = location
+        if event_color is not None:
+            body["colorId"] = str(event_color).strip()
+        if attendees is not None:
+            clean_attendees = [email.strip() for email in attendees if email and email.strip()]
+            body["attendees"] = [{"email": email} for email in clean_attendees]
+
+        if start is not None:
+            start_dt = self._to_datetime(start, timezone_name)
+            if end is not None:
+                end_dt = self._to_datetime(end, timezone_name)
+            else:
+                minutes = duration_minutes if duration_minutes and duration_minutes > 0 else 60
+                end_dt = start_dt + timedelta(minutes=minutes)
+            body["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone_name}
+            body["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone_name}
+        elif end is not None:
+            end_dt = self._to_datetime(end, timezone_name)
+            body["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone_name}
+
+        event = (
+            service.events()
+            .update(calendarId=resolved_calendar_id, eventId=event_id, body=body, sendUpdates="all")
+            .execute()
+        )
+        return self._calendar_event_out(event)
+
+    def list_colors(self) -> dict[str, str]:
+        service = self._service()
+        colors = service.colors().get().execute()
+        events = colors.get("event", {}) if isinstance(colors, dict) else {}
+        out: dict[str, str] = {}
+        for key, value in events.items():
+            if not isinstance(value, dict):
+                continue
+            out[str(key)] = str(value.get("background", ""))
+        return out

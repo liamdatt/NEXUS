@@ -33,13 +33,25 @@ class EmailTool(BaseTool):
         return ToolSpec(
             name=self.name,
             description=(
-                "Read and summarize inbox emails, search messages, and draft/send emails. "
-                "Sending requires explicit confirmation."
+                "Read Gmail threads/messages and perform draft/send/reply operations. "
+                "Write actions require explicit confirmation."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["summarize_unread", "summarize_search", "send_email"]},
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "summarize_unread",
+                            "summarize_search",
+                            "search_threads",
+                            "search_messages",
+                            "send_email",
+                            "create_draft",
+                            "send_draft",
+                            "reply",
+                        ],
+                    },
                     "query": {"type": "string"},
                     "max_results": {"type": "integer"},
                     "to": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -48,6 +60,9 @@ class EmailTool(BaseTool):
                     "subject": {"type": "string"},
                     "body_text": {"type": "string"},
                     "body_html": {"type": "string"},
+                    "draft_id": {"type": "string"},
+                    "reply_to_message_id": {"type": "string"},
+                    "thread_id": {"type": "string"},
                 },
                 "required": ["action"],
             },
@@ -66,41 +81,58 @@ class EmailTool(BaseTool):
             snippet = snippet.replace("\n", " ").strip()
             if len(snippet) > 220:
                 snippet = snippet[:217] + "..."
-            lines.append(f"{i}. {subject}\n   From: {sender}\n   Date: {date}\n   Summary: {snippet}")
+            thread_id = msg.get("thread_id") or "-"
+            message_count = msg.get("message_count")
+            line = (
+                f"{i}. {subject}\n"
+                f"   From: {sender}\n"
+                f"   Date: {date}\n"
+                f"   Thread: {thread_id}"
+            )
+            if message_count is not None:
+                line += f"\n   Messages: {message_count}"
+            line += f"\n   Summary: {snippet}"
+            lines.append(line)
         return "\n".join(lines)
 
     @staticmethod
-    def _draft_preview(
+    def _write_preview(
+        *,
+        action: str,
         to: list[str],
         cc: list[str],
         bcc: list[str],
         subject: str,
         body_text: str,
         body_html: str,
+        draft_id: str = "",
+        reply_to_message_id: str = "",
     ) -> str:
         preview_lines = [
-            "Draft email ready for confirmation.",
+            f"Email action requires confirmation: {action}",
             f"To: {', '.join(to) if to else '(none)'}",
             f"Cc: {', '.join(cc) if cc else '(none)'}",
             f"Bcc: {', '.join(bcc) if bcc else '(none)'}",
             f"Subject: {subject or '(no subject)'}",
         ]
+        if draft_id:
+            preview_lines.append(f"Draft ID: {draft_id}")
+        if reply_to_message_id:
+            preview_lines.append(f"Reply-To-Message-ID: {reply_to_message_id}")
         if body_text.strip():
             preview_lines.append(f"Body (text): {body_text.strip()[:500]}")
         elif body_html.strip():
             preview_lines.append(f"Body (html): {body_html.strip()[:500]}")
-        else:
-            preview_lines.append("Body: (empty)")
-        preview_lines.append("Reply YES to send or NO to cancel.")
+        preview_lines.append("Reply YES to proceed or NO to cancel.")
         return "\n".join(preview_lines)
 
     async def run(self, args: dict[str, Any]) -> ToolResult:
-        action = args.get("action")
+        action = str(args.get("action") or "")
         try:
             max_results = int(args.get("max_results") or self.settings.email_summary_max_results or 10)
         except (TypeError, ValueError):
             return ToolResult(ok=False, content="max_results must be an integer")
-        max_results = max(1, min(max_results, 25))
+        max_results = max(1, min(max_results, 50))
 
         if action == "summarize_unread":
             try:
@@ -109,38 +141,111 @@ class EmailTool(BaseTool):
                 return ToolResult(ok=False, content=f"email unread summary failed: {exc}")
             return ToolResult(ok=True, content=self._format_summary(messages))
 
-        if action == "summarize_search":
+        if action in {"summarize_search", "search_messages"}:
             query = str(args.get("query") or "").strip()
             if not query:
-                return ToolResult(ok=False, content="query is required for summarize_search")
+                return ToolResult(ok=False, content=f"query is required for {action}")
             try:
                 messages = self.client.list_messages(query, max_results=max_results)
             except Exception as exc:  # noqa: BLE001
-                return ToolResult(ok=False, content=f"email search summary failed: {exc}")
+                return ToolResult(ok=False, content=f"email message search failed: {exc}")
             return ToolResult(ok=True, content=self._format_summary(messages))
 
-        if action == "send_email":
-            to = _to_email_list(args.get("to"))
-            cc = _to_email_list(args.get("cc"))
-            bcc = _to_email_list(args.get("bcc"))
-            subject = str(args.get("subject") or "").strip()
-            body_text = str(args.get("body_text") or "")
-            body_html = str(args.get("body_html") or "")
+        if action == "search_threads":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return ToolResult(ok=False, content="query is required for search_threads")
+            try:
+                threads = self.client.search_threads(query, max_results=max_results)
+            except Exception as exc:  # noqa: BLE001
+                return ToolResult(ok=False, content=f"email thread search failed: {exc}")
+            return ToolResult(ok=True, content=self._format_summary(threads))
 
-            if not to:
-                return ToolResult(ok=False, content="to recipient(s) are required for send_email")
+        to = _to_email_list(args.get("to"))
+        cc = _to_email_list(args.get("cc"))
+        bcc = _to_email_list(args.get("bcc"))
+        subject = str(args.get("subject") or "").strip()
+        body_text = str(args.get("body_text") or "")
+        body_html = str(args.get("body_html") or "")
+        draft_id = str(args.get("draft_id") or "").strip()
+        reply_to_message_id = str(args.get("reply_to_message_id") or "").strip()
+        thread_id = str(args.get("thread_id") or "").strip() or None
 
-            preview = self._draft_preview(to, cc, bcc, subject, body_text, body_html)
+        if action == "send_draft":
+            if not draft_id:
+                return ToolResult(ok=False, content="draft_id is required for send_draft")
             if not args.get("confirmed"):
                 return ToolResult(
                     ok=False,
-                    content=preview,
+                    content=self._write_preview(
+                        action=action,
+                        to=[],
+                        cc=[],
+                        bcc=[],
+                        subject="",
+                        body_text="",
+                        body_html="",
+                        draft_id=draft_id,
+                    ),
+                    requires_confirmation=True,
+                    risk_level="high",
+                    proposed_action={"action": action, **args},
+                )
+            try:
+                result = self.client.send_draft(draft_id=draft_id)
+            except Exception as exc:  # noqa: BLE001
+                return ToolResult(ok=False, content=f"send_draft failed: {exc}")
+            return ToolResult(
+                ok=True,
+                content=f"Draft sent.\nid={result.get('id')}\nthread_id={result.get('thread_id')}",
+            )
+
+        if action in {"send_email", "create_draft", "reply"}:
+            if not to:
+                return ToolResult(ok=False, content=f"to recipient(s) are required for {action}")
+            if action == "reply" and not reply_to_message_id:
+                return ToolResult(ok=False, content="reply_to_message_id is required for reply")
+
+            if not args.get("confirmed"):
+                return ToolResult(
+                    ok=False,
+                    content=self._write_preview(
+                        action=action,
+                        to=to,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        body_text=body_text,
+                        body_html=body_html,
+                        reply_to_message_id=reply_to_message_id,
+                    ),
                     requires_confirmation=True,
                     risk_level="high",
                     proposed_action={"action": action, **args},
                 )
 
             try:
+                if action == "create_draft":
+                    result = self.client.create_draft(
+                        to=to,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        body_text=body_text,
+                        body_html=body_html,
+                        reply_to_message_id=reply_to_message_id or None,
+                        thread_id=thread_id,
+                    )
+                    return ToolResult(
+                        ok=True,
+                        content=(
+                            "Draft created.\n"
+                            f"id={result.get('id')}\n"
+                            f"message_id={result.get('message_id')}\n"
+                            f"thread_id={result.get('thread_id')}"
+                        ),
+                    )
+
                 result = self.client.send_message(
                     to=to,
                     cc=cc,
@@ -148,14 +253,17 @@ class EmailTool(BaseTool):
                     subject=subject,
                     body_text=body_text,
                     body_html=body_html,
+                    reply_to_message_id=reply_to_message_id or None,
+                    thread_id=thread_id,
                 )
             except Exception as exc:  # noqa: BLE001
-                return ToolResult(ok=False, content=f"send_email failed: {exc}")
+                return ToolResult(ok=False, content=f"{action} failed: {exc}")
 
+            success_label = "Reply sent successfully." if action == "reply" else "Email sent successfully."
             return ToolResult(
                 ok=True,
                 content=(
-                    "Email sent successfully.\n"
+                    f"{success_label}\n"
                     f"id={result.get('id')}\n"
                     f"thread_id={result.get('thread_id')}"
                 ),
