@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from nexus.config import Settings
 GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.events",
 )
 
@@ -39,6 +41,26 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _token_scopes(token_path: Path) -> list[str]:
+    try:
+        raw = json.loads(token_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return list(GOOGLE_SCOPES)
+    if not isinstance(raw, dict):
+        return list(GOOGLE_SCOPES)
+    scopes = raw.get("scopes")
+    if isinstance(scopes, list):
+        scoped = [str(item) for item in scopes if isinstance(item, str) and item.strip()]
+        if scoped:
+            return scoped
+    scope = raw.get("scope")
+    if isinstance(scope, str):
+        scoped = [chunk for chunk in scope.split() if chunk]
+        if scoped:
+            return scoped
+    return list(GOOGLE_SCOPES)
+
+
 def connect_google(settings: Settings) -> str:
     Request, Credentials, InstalledAppFlow = _require_google_auth_libs()
     del Request, Credentials  # keep interface explicit; only flow used during connect
@@ -66,18 +88,28 @@ def load_google_credentials(settings: Settings):
 
     token_path = _token_path(settings)
     if not token_path.exists():
+        guidance = (
+            "Connect Google from the hosted dashboard first."
+            if not settings.cli_enabled
+            else "Run `nexus auth google connect` first."
+        )
         raise RuntimeError(
-            f"Google token not found at {token_path}. Run `nexus auth google connect` first."
+            f"Google token not found at {token_path}. {guidance}"
         )
 
-    creds = Credentials.from_authorized_user_file(str(token_path), scopes=list(GOOGLE_SCOPES))
+    creds = Credentials.from_authorized_user_file(str(token_path), scopes=_token_scopes(token_path))
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         token_path.write_text(creds.to_json(), encoding="utf-8")
     if not creds.valid:
+        guidance = (
+            "Reconnect Google from the hosted dashboard."
+            if not settings.cli_enabled
+            else "Run `nexus auth google connect` again."
+        )
         raise RuntimeError(
             "Google credentials are invalid or expired without refresh token. "
-            "Run `nexus auth google connect` again."
+            f"{guidance}"
         )
     return creds
 
