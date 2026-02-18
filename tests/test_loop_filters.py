@@ -136,3 +136,30 @@ def test_outbound_echo_is_ignored(tmp_path: Path):
 
     asyncio.run(loop.handle_inbound(inbound, trace_id="trace-5"))
     assert sent == []
+
+
+def test_media_only_message_is_processed(tmp_path: Path):
+    loop, _, sent = _build_loop(tmp_path)
+
+    inbound = InboundMessage(
+        id="in-media-1",
+        channel="whatsapp",
+        chat_id="self@s.whatsapp.net",
+        sender_id="self@s.whatsapp.net",
+        is_self_chat=True,
+        is_from_me=True,
+        text="",
+        media=[
+            {
+                "type": "document",
+                "mime_type": "application/pdf",
+                "file_name": "doc.pdf",
+                "local_path": "/tmp/doc.pdf",
+                "download_status": "downloaded",
+            }
+        ],
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    asyncio.run(loop.handle_inbound(inbound, trace_id="trace-media-1"))
+    assert len(sent) == 1

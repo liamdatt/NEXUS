@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from nexus.config import Settings
@@ -20,6 +21,37 @@ def _to_email_list(value: Any) -> list[str]:
                 out.append(item.strip())
         return out
     return []
+
+
+def _to_attachment_candidates(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    out: list[dict[str, str]] = []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            out.append({"path": cleaned})
+        return out
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    out.append({"path": cleaned})
+                continue
+            if isinstance(item, dict):
+                raw_path = str(item.get("path") or "").strip()
+                if not raw_path:
+                    continue
+                normalized: dict[str, str] = {"path": raw_path}
+                file_name = str(item.get("file_name") or "").strip()
+                mime_type = str(item.get("mime_type") or "").strip()
+                if file_name:
+                    normalized["file_name"] = file_name
+                if mime_type:
+                    normalized["mime_type"] = mime_type
+                out.append(normalized)
+    return out
 
 
 class EmailTool(BaseTool):
@@ -63,6 +95,12 @@ class EmailTool(BaseTool):
                     "draft_id": {"type": "string"},
                     "reply_to_message_id": {"type": "string"},
                     "thread_id": {"type": "string"},
+                    "attachments": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array"},
+                        ]
+                    },
                 },
                 "required": ["action"],
             },
@@ -107,6 +145,7 @@ class EmailTool(BaseTool):
         body_html: str,
         draft_id: str = "",
         reply_to_message_id: str = "",
+        attachments: list[dict[str, str]] | None = None,
     ) -> str:
         preview_lines = [
             f"Email action requires confirmation: {action}",
@@ -123,8 +162,38 @@ class EmailTool(BaseTool):
             preview_lines.append(f"Body (text): {body_text.strip()[:500]}")
         elif body_html.strip():
             preview_lines.append(f"Body (html): {body_html.strip()[:500]}")
+        if attachments:
+            preview_lines.append(f"Attachments: {', '.join(item.get('file_name') or item.get('path', '-') for item in attachments)}")
         preview_lines.append("Reply YES to proceed or NO to cancel.")
         return "\n".join(preview_lines)
+
+    def _normalize_attachments(self, raw_value: Any) -> tuple[list[dict[str, str]], str | None]:
+        attachments = _to_attachment_candidates(raw_value)
+        if not attachments:
+            return [], None
+        workspace = self.settings.workspace.resolve()
+        resolved: list[dict[str, str]] = []
+        for item in attachments:
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = workspace / candidate
+            full = candidate.resolve()
+            if workspace != full and workspace not in full.parents:
+                return [], f"attachment path escapes workspace: {full}"
+            if not full.exists() or not full.is_file():
+                return [], f"attachment file not found: {full}"
+            payload = {
+                "path": str(full),
+                "file_name": str(item.get("file_name") or full.name),
+            }
+            mime_type = str(item.get("mime_type") or "").strip()
+            if mime_type:
+                payload["mime_type"] = mime_type
+            resolved.append(payload)
+        return resolved, None
 
     async def run(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "")
@@ -170,6 +239,9 @@ class EmailTool(BaseTool):
         draft_id = str(args.get("draft_id") or "").strip()
         reply_to_message_id = str(args.get("reply_to_message_id") or "").strip()
         thread_id = str(args.get("thread_id") or "").strip() or None
+        attachments, attachment_error = self._normalize_attachments(args.get("attachments"))
+        if attachment_error:
+            return ToolResult(ok=False, content=attachment_error)
 
         if action == "send_draft":
             if not draft_id:
@@ -186,6 +258,7 @@ class EmailTool(BaseTool):
                         body_text="",
                         body_html="",
                         draft_id=draft_id,
+                        attachments=attachments,
                     ),
                     requires_confirmation=True,
                     risk_level="high",
@@ -218,6 +291,7 @@ class EmailTool(BaseTool):
                         body_text=body_text,
                         body_html=body_html,
                         reply_to_message_id=reply_to_message_id,
+                        attachments=attachments,
                     ),
                     requires_confirmation=True,
                     risk_level="high",
@@ -235,6 +309,7 @@ class EmailTool(BaseTool):
                         body_html=body_html,
                         reply_to_message_id=reply_to_message_id or None,
                         thread_id=thread_id,
+                        attachments=attachments,
                     )
                     return ToolResult(
                         ok=True,
@@ -255,6 +330,7 @@ class EmailTool(BaseTool):
                     body_html=body_html,
                     reply_to_message_id=reply_to_message_id or None,
                     thread_id=thread_id,
+                    attachments=attachments,
                 )
             except Exception as exc:  # noqa: BLE001
                 return ToolResult(ok=False, content=f"{action} failed: {exc}")

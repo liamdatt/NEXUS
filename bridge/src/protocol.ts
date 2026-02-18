@@ -24,6 +24,11 @@ export interface InboundMedia {
   mime_type?: string;
   file_name?: string;
   caption?: string;
+  local_path?: string;
+  size_bytes?: number;
+  sha256?: string;
+  download_status?: "downloaded" | "skipped" | "failed";
+  download_error?: string;
 }
 
 export interface InboundPayload {
@@ -56,6 +61,7 @@ export interface OutboundPayload {
 export interface DeliveryPayload {
   outbound_id: string;
   provider_message_id: string;
+  provider_message_ids?: string[];
   chat_id: string;
   timestamp: string;
 }

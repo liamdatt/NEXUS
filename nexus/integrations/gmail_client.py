@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import mimetypes
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 from nexus.config import Settings
@@ -125,6 +127,7 @@ class GmailClient:
         body_text: str | None,
         body_html: str | None,
         reply_to_message_id: str | None,
+        attachments: list[dict[str, str]] | None,
     ) -> EmailMessage:
         message = EmailMessage()
         message["To"] = ", ".join([addr for addr in to if addr])
@@ -147,6 +150,26 @@ class GmailClient:
             message.set_content("")
         if html:
             message.add_alternative(html, subtype="html")
+
+        for attachment in attachments or []:
+            file_path = Path(str(attachment.get("path") or "")).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            file_name = str(attachment.get("file_name") or file_path.name)
+            mime_type = str(attachment.get("mime_type") or "").strip()
+            if not mime_type:
+                guessed, _encoding = mimetypes.guess_type(file_path.name)
+                mime_type = guessed or "application/octet-stream"
+            major, _sep, minor = mime_type.partition("/")
+            if not major or not minor:
+                major, minor = "application", "octet-stream"
+            payload = file_path.read_bytes()
+            message.add_attachment(
+                payload,
+                maintype=major,
+                subtype=minor,
+                filename=file_name,
+            )
         return message
 
     def send_message(
@@ -160,6 +183,7 @@ class GmailClient:
         body_html: str | None,
         reply_to_message_id: str | None = None,
         thread_id: str | None = None,
+        attachments: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         service = self._service()
         message = self._build_message(
@@ -170,6 +194,7 @@ class GmailClient:
             body_text=body_text,
             body_html=body_html,
             reply_to_message_id=reply_to_message_id,
+            attachments=attachments,
         )
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
@@ -199,6 +224,7 @@ class GmailClient:
         body_html: str | None,
         reply_to_message_id: str | None = None,
         thread_id: str | None = None,
+        attachments: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         service = self._service()
         message = self._build_message(
@@ -209,6 +235,7 @@ class GmailClient:
             body_text=body_text,
             body_html=body_html,
             reply_to_message_id=reply_to_message_id,
+            attachments=attachments,
         )
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         payload: dict[str, Any] = {"message": {"raw": raw}}

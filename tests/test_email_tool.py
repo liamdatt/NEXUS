@@ -104,6 +104,9 @@ def test_send_email_requires_confirmation(tmp_path: Path):
 def test_send_email_executes_when_confirmed(tmp_path: Path):
     client = _FakeGmailClient()
     tool = EmailTool(_settings(tmp_path), client=client)
+    attachment = tmp_path / "workspace" / "report.txt"
+    attachment.parent.mkdir(parents=True, exist_ok=True)
+    attachment.write_text("hello", encoding="utf-8")
     result = asyncio.run(
         tool.run(
             {
@@ -113,6 +116,7 @@ def test_send_email_executes_when_confirmed(tmp_path: Path):
                 "subject": "Launch",
                 "body_text": "Ready",
                 "body_html": "<p>Ready</p>",
+                "attachments": [{"path": str(attachment)}],
                 "confirmed": True,
             }
         )
@@ -121,6 +125,7 @@ def test_send_email_executes_when_confirmed(tmp_path: Path):
     assert "Email sent successfully" in result.content
     assert client.sent_payload is not None
     assert client.sent_payload["to"] == ["a@example.com", "b@example.com"]
+    assert client.sent_payload["attachments"][0]["path"] == str(attachment.resolve())
 
 
 def test_create_draft_requires_confirmation(tmp_path: Path):

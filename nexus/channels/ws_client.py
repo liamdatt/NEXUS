@@ -103,9 +103,21 @@ class BridgeClient:
                     logger.warning("BridgeClient ignored delivery payload type=%s", type(payload).__name__)
                     continue
                 provider_message_id = str(payload.get("provider_message_id", ""))
+                provider_message_ids = payload.get("provider_message_ids")
                 chat_id = str(payload.get("chat_id", ""))
-                if self.on_delivery and provider_message_id and chat_id:
+                if not self.on_delivery or not chat_id:
+                    continue
+                seen: set[str] = set()
+                if provider_message_id:
+                    seen.add(provider_message_id)
                     self.on_delivery(provider_message_id, chat_id)
+                if isinstance(provider_message_ids, list):
+                    for item in provider_message_ids:
+                        candidate = str(item or "")
+                        if not candidate or candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        self.on_delivery(candidate, chat_id)
         elif event == "bridge.qr":
             logger.info("BridgeClient received bridge.qr")
         elif event == "bridge.connected":

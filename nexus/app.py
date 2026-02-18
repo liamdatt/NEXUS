@@ -21,7 +21,10 @@ from nexus.tools.contacts import ContactsTool
 from nexus.tools.docs import DocsTool
 from nexus.tools.drive import DriveTool
 from nexus.tools.email import EmailTool
+from nexus.tools.excel import ExcelTool
 from nexus.tools.files import FileSystemTool
+from nexus.tools.images import ImagesTool
+from nexus.tools.pdf import PdfTool
 from nexus.tools.scheduler import SchedulerTool
 from nexus.tools.sheets import SheetsTool
 from nexus.tools.web import WebTool
@@ -60,6 +63,9 @@ async def main() -> None:
     tools.register(ContactsTool(settings))
     tools.register(SheetsTool(settings))
     tools.register(DocsTool(settings))
+    tools.register(ExcelTool(settings))
+    tools.register(PdfTool(settings))
+    tools.register(ImagesTool(settings))
 
     loop = NexusLoop(
         settings=settings,

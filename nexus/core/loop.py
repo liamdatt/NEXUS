@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -88,6 +89,98 @@ class NexusLoop:
         with self.redacted_log_path.open("a", encoding="utf-8") as fp:
             fp.write(safe_line)
 
+    @staticmethod
+    def _media_line(media: Any) -> str:
+        if not isinstance(media, dict):
+            return "- unknown media payload"
+        media_type = str(media.get("type") or "unknown")
+        file_name = str(media.get("file_name") or "(unnamed)")
+        mime_type = str(media.get("mime_type") or "-")
+        local_path = str(media.get("local_path") or "-")
+        size_bytes = media.get("size_bytes")
+        status = str(media.get("download_status") or "unknown")
+        error = str(media.get("download_error") or "")
+        size_text = str(size_bytes) if isinstance(size_bytes, int) else "-"
+        line = (
+            f"- type={media_type} file_name={file_name} mime={mime_type} "
+            f"local_path={local_path} size_bytes={size_text} status={status}"
+        )
+        if error:
+            line += f" error={error}"
+        return line
+
+    def _render_media_context_block(self, media_items: list[dict[str, Any]] | None) -> str:
+        if not media_items:
+            return ""
+        lines = ["[MEDIA_CONTEXT]"]
+        lines.extend(self._media_line(item) for item in media_items)
+        lines.append("[/MEDIA_CONTEXT]")
+        return "\n".join(lines)
+
+    def _effective_user_text(self, inbound: InboundMessage) -> str:
+        text = (inbound.text or "").strip()
+        media_items = [item.model_dump() for item in (inbound.media or [])]
+        media_block = self._render_media_context_block(media_items)
+        if text and media_block:
+            return f"{text}\n\n{media_block}"
+        if media_block:
+            return media_block
+        return text
+
+    def _attachments_from_artifacts(self, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for item in artifacts:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            file_path = Path(raw_path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            mime_type = str(item.get("mime_type") or "").strip()
+            raw_type = str(item.get("type") or "").strip().lower()
+            if raw_type not in {"image", "document"}:
+                if mime_type.startswith("image/"):
+                    raw_type = "image"
+                else:
+                    raw_type = "document"
+            payload: dict[str, Any] = {
+                "type": raw_type,
+                "path": str(file_path),
+                "file_name": str(item.get("file_name") or file_path.name),
+            }
+            if mime_type:
+                payload["mime_type"] = mime_type
+            caption = str(item.get("caption") or "").strip()
+            if caption:
+                payload["caption"] = caption
+            out.append(payload)
+        return out
+
+    async def _send_tool_result(self, inbound: InboundMessage, result: ToolResult) -> None:
+        safe_content = self._redact(result.content or "").strip()
+        if not safe_content:
+            safe_content = "Task completed, but there was no textual output."
+
+        attachments = self._attachments_from_artifacts(result.artifacts)
+        if inbound.channel == "cli" and attachments:
+            attachment_lines = "\n".join(
+                f"- {att.get('file_name') or att.get('path')}: {att.get('path')}" for att in attachments
+            )
+            safe_content = f"{safe_content}\n\nGenerated files:\n{attachment_lines}"
+            attachments = []
+
+        out = OutboundMessage(
+            id=str(uuid4()),
+            channel=inbound.channel,
+            chat_id=inbound.chat_id,
+            text=safe_content,
+            attachments=attachments or None,
+            reply_to=inbound.id,
+        )
+        await self._send(out)
+
     async def _send_text(self, inbound: InboundMessage, text: str) -> None:
         out = OutboundMessage(
             id=str(uuid4()),
@@ -106,7 +199,13 @@ class NexusLoop:
             await self._send_cli(message.text or "")
         self._write_redacted_log(
             "outbound.message",
-            {"message_id": message.id, "channel": message.channel, "chat_id": message.chat_id, "text": message.text or ""},
+            {
+                "message_id": message.id,
+                "channel": message.channel,
+                "chat_id": message.chat_id,
+                "text": message.text or "",
+                "attachments": [att.model_dump() for att in (message.attachments or [])],
+            },
         )
 
         self.db.insert_message(
@@ -202,6 +301,19 @@ class NexusLoop:
         if len(content) > limit:
             content = f"{content[:limit]}...(truncated)"
         status = "ok" if result.ok else "error"
+        if result.artifacts:
+            artifact_lines: list[str] = []
+            for artifact in result.artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                artifact_lines.append(
+                    f"- type={artifact.get('type', '-')}, path={artifact.get('path', '-')}, file_name={artifact.get('file_name', '-')}"
+                )
+            if artifact_lines:
+                return (
+                    f"status={status}\ncontent={content}\nartifacts_count={len(artifact_lines)}\nartifacts=\n"
+                    + "\n".join(artifact_lines)
+                )
         return f"status={status}\ncontent={content}"
 
     async def _execute_tool(
@@ -222,10 +334,7 @@ class NexusLoop:
             )
             return
 
-        safe_content = self._redact(result.content or "").strip()
-        if not safe_content:
-            safe_content = "Task completed, but there was no textual output."
-        await self._send_text(inbound, safe_content)
+        await self._send_tool_result(inbound, result)
         self.db.insert_audit(trace_id=trace_id, event="tool.execute", payload={"tool": tool_name, "ok": result.ok})
         self.journals.append_event(f"tool={tool_name} ok={result.ok} chat_id={inbound.chat_id}")
 
@@ -320,6 +429,8 @@ class NexusLoop:
                 event="tool.execute",
                 payload={"tool": tool_name, "ok": result.ok},
             )
+            if result.artifacts:
+                await self._send_tool_result(inbound, result)
             observation = self._format_observation(result)
             self.db.insert_audit(
                 trace_id=trace_id,
@@ -389,8 +500,9 @@ class NexusLoop:
             )
             return
 
-        text = inbound.text or ""
-        if inbound.channel == "whatsapp" and not text.strip() and not inbound.media:
+        raw_text = inbound.text or ""
+        effective_text = self._effective_user_text(inbound)
+        if inbound.channel == "whatsapp" and not raw_text.strip() and not inbound.media:
             logger.info(
                 "Ignored WA message id=%s chat_id=%s because it has no text/media payload",
                 inbound.id,
@@ -404,7 +516,7 @@ class NexusLoop:
             chat_id=inbound.chat_id,
             sender_id=inbound.sender_id,
             role="user",
-            text=self._redact(text),
+            text=self._redact(effective_text),
             trace_id=trace_id,
         )
         self._write_redacted_log(
@@ -414,13 +526,14 @@ class NexusLoop:
                 "channel": inbound.channel,
                 "chat_id": inbound.chat_id,
                 "sender_id": inbound.sender_id,
-                "text": text,
+                "text": raw_text,
+                "media": [item.model_dump() for item in (inbound.media or [])],
             },
         )
-        self.memory.append_turn(inbound.chat_id, "user", text)
+        self.memory.append_turn(inbound.chat_id, "user", effective_text)
 
-        if text.strip():
-            maybe_pending = self.policy.resolve_pending_action_from_text(inbound.chat_id, text)
+        if raw_text.strip():
+            maybe_pending = self.policy.resolve_pending_action_from_text(inbound.chat_id, raw_text)
             if maybe_pending:
                 if maybe_pending.status == "approved":
                     proposed = maybe_pending.proposed_args
@@ -435,7 +548,7 @@ class NexusLoop:
                     await self._send_text(inbound, "Cancelled pending action.")
                 return
 
-        direct = self._parse_tool_command(text)
+        direct = self._parse_tool_command(raw_text)
         if direct:
             if direct.get("type") == "tool":
                 tool_name = direct.get("tool", "")
@@ -449,7 +562,8 @@ class NexusLoop:
                 self.journals.append_event(f"response chat_id={inbound.chat_id}")
                 return
 
-        await self._run_react_loop(inbound, trace_id=trace_id)
+        llm_inbound = inbound.model_copy(update={"text": effective_text})
+        await self._run_react_loop(llm_inbound, trace_id=trace_id)
 
     async def emit_scheduler_message(self, chat_id: str, text: str) -> None:
         channel = "cli" if chat_id == "cli-user" else "whatsapp"

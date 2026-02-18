@@ -89,6 +89,17 @@ def test_bridge_client_handles_list_payload_without_crash(tmp_path: Path):
                     "is_self_chat": True,
                     "is_from_me": True,
                     "text": "hello",
+                    "media": [
+                        {
+                            "type": "document",
+                            "mime_type": "application/pdf",
+                            "file_name": "doc.pdf",
+                            "local_path": "/tmp/doc.pdf",
+                            "size_bytes": 100,
+                            "sha256": "abc",
+                            "download_status": "downloaded",
+                        }
+                    ],
                     "timestamp": "2026-02-09T00:00:00Z",
                 }
             ],
@@ -109,6 +120,44 @@ def test_bridge_client_handles_list_payload_without_crash(tmp_path: Path):
     asyncio.run(client._handle_message(delivery_env))
 
     assert seen == {"inbound": 1, "deliveries": 1}
+
+
+def test_bridge_client_registers_all_delivery_ids(tmp_path: Path):
+    settings = Settings(
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+    )
+
+    seen: list[str] = []
+
+    async def on_inbound(msg, trace_id):  # noqa: ANN001
+        return None
+
+    def on_delivery(provider_message_id, chat_id):  # noqa: ANN001
+        seen.append(provider_message_id)
+
+    client = BridgeClient(settings=settings, on_inbound=on_inbound, on_delivery=on_delivery)
+
+    delivery_env = json.dumps(
+        {
+            "event": "bridge.delivery_receipt",
+            "message_id": "m2",
+            "timestamp": "2026-02-09T00:00:00Z",
+            "channel": "whatsapp",
+            "trace_id": "t2",
+            "payload": [
+                {
+                    "provider_message_id": "p1",
+                    "provider_message_ids": ["p1", "p2", "p3"],
+                    "chat_id": "123@lid",
+                }
+            ],
+        }
+    )
+    asyncio.run(client._handle_message(delivery_env))
+
+    assert seen == ["p1", "p2", "p3"]
 
 
 def test_bridge_client_handles_bridge_diagnostic_events_without_crash(tmp_path: Path, caplog):

@@ -45,6 +45,19 @@ class _EchoTool(BaseTool):
                 requires_confirmation=True,
                 risk_level="high",
             )
+        if action == "artifact":
+            return ToolResult(
+                ok=True,
+                content="artifact ready",
+                artifacts=[
+                    {
+                        "type": "document",
+                        "path": str(args.get("artifact_path") or ""),
+                        "file_name": "artifact.txt",
+                        "mime_type": "text/plain",
+                    }
+                ],
+            )
         return ToolResult(ok=True, content=f"obs:{action or 'none'}")
 
 
@@ -186,3 +199,23 @@ def test_react_thought_is_not_user_visible_or_persisted(tmp_path: Path):
     if log_path.exists():
         content = log_path.read_text(encoding="utf-8")
         assert "SECRET_THOUGHT_SHOULD_NOT_LEAK" not in content
+
+
+def test_direct_tool_artifact_is_sent_as_attachment(tmp_path: Path):
+    llm = _SequenceLLM(['{"thought":"unused","response":"ok"}'])
+    loop, sent, _db, _settings_obj = _build_loop(tmp_path, llm)
+
+    artifact = tmp_path / "workspace" / "artifact.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("artifact", encoding="utf-8")
+
+    inbound = _inbound(
+        "react-artifact",
+        text=f'/tool echo {{"action":"artifact","artifact_path":"{artifact}"}}',
+    )
+    asyncio.run(loop.handle_inbound(inbound, trace_id="t-react-artifact"))
+
+    assert len(sent) == 1
+    message = sent[0]
+    assert getattr(message, "attachments", None)
+    assert message.attachments[0].path == str(artifact.resolve())

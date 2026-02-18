@@ -32,6 +32,11 @@ class MediaItem(BaseModel):
     mime_type: str | None = None
     file_name: str | None = None
     caption: str | None = None
+    local_path: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    download_status: Literal["downloaded", "skipped", "failed"] | None = None
+    download_error: str | None = None
 
 
 class InboundMessage(BaseModel):
@@ -66,6 +71,7 @@ class OutboundMessage(BaseModel):
 class DeliveryReceipt(BaseModel):
     outbound_id: str
     provider_message_id: str
+    provider_message_ids: list[str] | None = None
     chat_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
