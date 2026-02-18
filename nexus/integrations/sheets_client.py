@@ -20,6 +20,33 @@ class SheetsClient:
         creds = load_google_credentials(self.settings)
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
+    def create_spreadsheet(self, title: str, sheet_title: str | None = None) -> dict[str, Any]:
+        service = self._service()
+
+        body: dict[str, Any] = {
+            "properties": {"title": title},
+        }
+        if sheet_title:
+            body["sheets"] = [{"properties": {"title": sheet_title}}]
+
+        created = service.spreadsheets().create(body=body).execute()
+
+        resolved_sheet_title = ""
+        sheets = created.get("sheets")
+        if isinstance(sheets, list) and sheets:
+            first = sheets[0]
+            if isinstance(first, dict):
+                properties = first.get("properties")
+                if isinstance(properties, dict):
+                    resolved_sheet_title = str(properties.get("title") or "")
+
+        return {
+            "spreadsheet_id": str(created.get("spreadsheetId", "")),
+            "title": str((created.get("properties") or {}).get("title") or title),
+            "spreadsheet_url": str(created.get("spreadsheetUrl", "")),
+            "sheet_title": resolved_sheet_title or (sheet_title or "Sheet1"),
+        }
+
     def get_values(self, spreadsheet_id: str, range_a1: str) -> dict[str, Any]:
         service = self._service()
         return (
