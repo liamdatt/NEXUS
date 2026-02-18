@@ -95,7 +95,17 @@ class BridgeClient:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("BridgeClient inbound payload validation failed: %s", exc)
                     continue
-                await self.on_inbound(msg, trace_id)
+                try:
+                    await self.on_inbound(msg, trace_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "BridgeClient inbound handler error: id=%s chat_id=%s trace_id=%s error=%s",
+                        msg.id,
+                        msg.chat_id,
+                        trace_id,
+                        exc,
+                    )
+                    continue
         elif event == "bridge.delivery_receipt":
             payloads = payload_obj if isinstance(payload_obj, list) else [payload_obj]
             for payload in payloads:

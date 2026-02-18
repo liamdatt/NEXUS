@@ -84,7 +84,16 @@ class NexusLoop:
 
     def _write_redacted_log(self, event: str, payload: dict) -> None:
         self.redacted_log_path.parent.mkdir(parents=True, exist_ok=True)
-        safe_payload = json.dumps(payload, ensure_ascii=True)
+        try:
+            safe_payload = json.dumps(payload, ensure_ascii=True)
+        except Exception as exc:  # noqa: BLE001
+            safe_payload = json.dumps(
+                {
+                    "serialization_error": str(exc),
+                    "payload_repr": repr(payload),
+                },
+                ensure_ascii=True,
+            )
         safe_line = f"{datetime.now(timezone.utc).isoformat()} event={event} payload={self._redact(safe_payload)}\n"
         with self.redacted_log_path.open("a", encoding="utf-8") as fp:
             fp.write(safe_line)
@@ -464,106 +473,143 @@ class NexusLoop:
         )
 
     async def handle_inbound(self, inbound: InboundMessage, trace_id: str) -> None:
-        if inbound.channel == "whatsapp":
-            if not inbound.is_self_chat:
-                logger.info(
-                    "Ignored WA message id=%s chat_id=%s because not self-chat",
-                    inbound.id,
-                    inbound.chat_id,
-                )
-                return
-            if not inbound.is_from_me:
-                if _wa_sender_matches_chat(inbound.sender_id, inbound.chat_id):
+        try:
+            if inbound.channel == "whatsapp":
+                if not inbound.is_self_chat:
                     logger.info(
-                        "Accepted WA message id=%s chat_id=%s despite from-me=false because sender_id matches chat identity",
-                        inbound.id,
-                        inbound.chat_id,
-                    )
-                else:
-                    logger.info(
-                        "Ignored WA message id=%s chat_id=%s because not from-me and sender_id does not match chat identity",
+                        "Ignored WA message id=%s chat_id=%s because not self-chat",
                         inbound.id,
                         inbound.chat_id,
                     )
                     return
+                if not inbound.is_from_me:
+                    if _wa_sender_matches_chat(inbound.sender_id, inbound.chat_id):
+                        logger.info(
+                            "Accepted WA message id=%s chat_id=%s despite from-me=false because sender_id matches chat identity",
+                            inbound.id,
+                            inbound.chat_id,
+                        )
+                    else:
+                        logger.info(
+                            "Ignored WA message id=%s chat_id=%s because not from-me and sender_id does not match chat identity",
+                            inbound.id,
+                            inbound.chat_id,
+                        )
+                        return
 
-        claimed = self.db.claim_ledger(inbound.id, "inbound", inbound.chat_id)
-        if not claimed:
-            reason = "it is already present in the inbound ledger"
-            if inbound.channel == "whatsapp" and self.db.ledger_contains(inbound.id, direction="outbound"):
-                reason = "it matches outbound ledger"
-            logger.info(
-                "Ignored WA message id=%s chat_id=%s because %s",
+            claimed = self.db.claim_ledger(inbound.id, "inbound", inbound.chat_id)
+            if not claimed:
+                reason = "it is already present in the inbound ledger"
+                if inbound.channel == "whatsapp" and self.db.ledger_contains(inbound.id, direction="outbound"):
+                    reason = "it matches outbound ledger"
+                logger.info(
+                    "Ignored WA message id=%s chat_id=%s because %s",
+                    inbound.id,
+                    inbound.chat_id,
+                    reason,
+                )
+                return
+
+            raw_text = inbound.text or ""
+            effective_text = self._effective_user_text(inbound)
+            if inbound.channel == "whatsapp" and not raw_text.strip() and not inbound.media:
+                logger.info(
+                    "Ignored WA message id=%s chat_id=%s because it has no text/media payload",
+                    inbound.id,
+                    inbound.chat_id,
+                )
+                return
+
+            self.db.insert_message(
+                message_id=inbound.id,
+                channel=inbound.channel,
+                chat_id=inbound.chat_id,
+                sender_id=inbound.sender_id,
+                role="user",
+                text=self._redact(effective_text),
+                trace_id=trace_id,
+            )
+            self._write_redacted_log(
+                "inbound.message",
+                {
+                    "message_id": inbound.id,
+                    "channel": inbound.channel,
+                    "chat_id": inbound.chat_id,
+                    "sender_id": inbound.sender_id,
+                    "text": raw_text,
+                    "media": [item.model_dump() for item in (inbound.media or [])],
+                },
+            )
+            self.memory.append_turn(inbound.chat_id, "user", effective_text)
+
+            if raw_text.strip():
+                maybe_pending = self.policy.resolve_pending_action_from_text(inbound.chat_id, raw_text)
+                if maybe_pending:
+                    if maybe_pending.status == "approved":
+                        proposed = maybe_pending.proposed_args
+                        await self._execute_tool(
+                            inbound,
+                            tool_name=proposed["tool"],
+                            args=proposed["args"],
+                            trace_id=trace_id,
+                            confirmed=True,
+                        )
+                    else:
+                        await self._send_text(inbound, "Cancelled pending action.")
+                    return
+
+            direct = self._parse_tool_command(raw_text)
+            if direct:
+                if direct.get("type") == "tool":
+                    tool_name = direct.get("tool", "")
+                    args = direct.get("args", {}) if isinstance(direct.get("args"), dict) else {}
+                    logger.info("Executing direct tool=%s for chat_id=%s", tool_name, inbound.chat_id)
+                    await self._execute_tool(inbound, tool_name=tool_name, args=args, trace_id=trace_id)
+                    return
+                if direct.get("type") == "response":
+                    response = str(direct.get("text") or "")
+                    await self._send_text(inbound, self._redact(response))
+                    self.journals.append_event(f"response chat_id={inbound.chat_id}")
+                    return
+
+            llm_inbound = inbound.model_copy(update={"text": effective_text})
+            await self._run_react_loop(llm_inbound, trace_id=trace_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Inbound processing failed id=%s chat_id=%s trace_id=%s",
                 inbound.id,
                 inbound.chat_id,
-                reason,
+                trace_id,
             )
-            return
+            try:
+                self.db.insert_audit(
+                    trace_id=trace_id,
+                    event="inbound.error",
+                    payload={
+                        "message_id": inbound.id,
+                        "chat_id": inbound.chat_id,
+                        "channel": inbound.channel,
+                        "error": str(exc),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to persist inbound.error audit id=%s chat_id=%s trace_id=%s",
+                    inbound.id,
+                    inbound.chat_id,
+                    trace_id,
+                )
 
-        raw_text = inbound.text or ""
-        effective_text = self._effective_user_text(inbound)
-        if inbound.channel == "whatsapp" and not raw_text.strip() and not inbound.media:
-            logger.info(
-                "Ignored WA message id=%s chat_id=%s because it has no text/media payload",
-                inbound.id,
-                inbound.chat_id,
-            )
-            return
-
-        self.db.insert_message(
-            message_id=inbound.id,
-            channel=inbound.channel,
-            chat_id=inbound.chat_id,
-            sender_id=inbound.sender_id,
-            role="user",
-            text=self._redact(effective_text),
-            trace_id=trace_id,
-        )
-        self._write_redacted_log(
-            "inbound.message",
-            {
-                "message_id": inbound.id,
-                "channel": inbound.channel,
-                "chat_id": inbound.chat_id,
-                "sender_id": inbound.sender_id,
-                "text": raw_text,
-                "media": [item.model_dump() for item in (inbound.media or [])],
-            },
-        )
-        self.memory.append_turn(inbound.chat_id, "user", effective_text)
-
-        if raw_text.strip():
-            maybe_pending = self.policy.resolve_pending_action_from_text(inbound.chat_id, raw_text)
-            if maybe_pending:
-                if maybe_pending.status == "approved":
-                    proposed = maybe_pending.proposed_args
-                    await self._execute_tool(
-                        inbound,
-                        tool_name=proposed["tool"],
-                        args=proposed["args"],
-                        trace_id=trace_id,
-                        confirmed=True,
-                    )
-                else:
-                    await self._send_text(inbound, "Cancelled pending action.")
-                return
-
-        direct = self._parse_tool_command(raw_text)
-        if direct:
-            if direct.get("type") == "tool":
-                tool_name = direct.get("tool", "")
-                args = direct.get("args", {}) if isinstance(direct.get("args"), dict) else {}
-                logger.info("Executing direct tool=%s for chat_id=%s", tool_name, inbound.chat_id)
-                await self._execute_tool(inbound, tool_name=tool_name, args=args, trace_id=trace_id)
-                return
-            if direct.get("type") == "response":
-                response = str(direct.get("text") or "")
-                await self._send_text(inbound, self._redact(response))
-                self.journals.append_event(f"response chat_id={inbound.chat_id}")
-                return
-
-        llm_inbound = inbound.model_copy(update={"text": effective_text})
-        await self._run_react_loop(llm_inbound, trace_id=trace_id)
+            fallback = "I hit an internal processing error while handling that request. Please try again."
+            try:
+                await self._send_text(inbound, fallback)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to send inbound error reply id=%s chat_id=%s trace_id=%s",
+                    inbound.id,
+                    inbound.chat_id,
+                    trace_id,
+                )
 
     async def emit_scheduler_message(self, chat_id: str, text: str) -> None:
         channel = "cli" if chat_id == "cli-user" else "whatsapp"

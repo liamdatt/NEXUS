@@ -58,6 +58,8 @@ class _EchoTool(BaseTool):
                     }
                 ],
             )
+        if action == "explode":
+            raise RuntimeError("boom")
         return ToolResult(ok=True, content=f"obs:{action or 'none'}")
 
 
@@ -219,3 +221,21 @@ def test_direct_tool_artifact_is_sent_as_attachment(tmp_path: Path):
     message = sent[0]
     assert getattr(message, "attachments", None)
     assert message.attachments[0].path == str(artifact.resolve())
+
+
+def test_inbound_exception_returns_safe_error_and_continues(tmp_path: Path):
+    llm = _SequenceLLM(['{"thought":"unused","response":"ok"}'])
+    loop, sent, _db, settings = _build_loop(tmp_path, llm)
+
+    inbound = _inbound("react-explode", text='/tool echo {"action":"explode"}')
+    asyncio.run(loop.handle_inbound(inbound, trace_id="t-react-explode"))
+
+    assert len(sent) == 1
+    assert "internal processing error" in (getattr(sent[0], "text", "") or "").lower()
+    events = _audit_events(settings.db_path)
+    assert "inbound.error" in events
+
+    follow_up = _inbound("react-follow-up", text='/tool echo {"action":"a"}')
+    asyncio.run(loop.handle_inbound(follow_up, trace_id="t-react-follow-up"))
+    assert len(sent) == 2
+    assert "obs:a" in (getattr(sent[1], "text", "") or "")

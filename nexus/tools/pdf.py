@@ -38,18 +38,19 @@ class PdfTool(BaseTool):
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name=self.name,
-            description="Create, extract, merge, and AI-edit PDFs in workspace.",
+            description="Create, inspect, extract, merge, and AI-edit PDFs in workspace.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "extract_text", "merge", "edit_page_nl"],
+                        "enum": ["create", "inspect", "extract_text", "merge", "edit_page_nl"],
                     },
                     "path": {"type": "string"},
                     "output_path": {"type": "string"},
                     "input_paths": {"type": "array", "items": {"type": "string"}},
                     "page": {"type": "integer"},
+                    "page_index_mode": {"type": "string", "enum": ["auto", "zero_based", "one_based"]},
                     "instruction": {"type": "string"},
                     "text": {"type": "string"},
                     "title": {"type": "string"},
@@ -89,6 +90,28 @@ class PdfTool(BaseTool):
             ]
         )
 
+    @staticmethod
+    def _verify_pdf(path: Path) -> bool:
+        try:
+            reader = PdfReader(str(path))
+            _ = len(reader.pages)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _candidate_pages(page: int, mode: str) -> list[int]:
+        if mode == "zero_based":
+            return [page]
+        if mode == "one_based":
+            return [page - 1]
+
+        candidates: list[int] = []
+        for candidate in (page, page - 1):
+            if candidate >= 0 and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
     async def run(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "")
 
@@ -124,11 +147,40 @@ class PdfTool(BaseTool):
                 pdf.set_font("Helvetica", size=12)
             pdf.multi_cell(0, 8, text)
             pdf.output(str(file_path))
-            return ToolResult(
-                ok=True,
-                content=f"PDF created.\npath={file_path}",
-                artifacts=[self._artifact(file_path)],
-            )
+            return ToolResult(ok=True, content=f"PDF created.\npath={file_path}", artifacts=[self._artifact(file_path)])
+
+        if action == "inspect":
+            raw_path = str(args.get("path") or "").strip()
+            if not raw_path:
+                return ToolResult(ok=False, content="path is required for inspect")
+            try:
+                file_path = self._resolve_workspace_path(raw_path)
+            except PermissionError as exc:
+                return ToolResult(ok=False, content=f"path rejected: {exc}")
+            if not file_path.exists() or not file_path.is_file():
+                return ToolResult(ok=False, content=f"pdf not found: {file_path}")
+
+            reader = PdfReader(str(file_path))
+            metadata = reader.metadata or {}
+            lines = [f"PDF inspect.\npath={file_path}\npages={len(reader.pages)}"]
+            if metadata:
+                keys = ["/Title", "/Author", "/Creator", "/Producer", "/CreationDate", "/ModDate"]
+                meta_bits = []
+                for key in keys:
+                    value = metadata.get(key)
+                    if value:
+                        meta_bits.append(f"{key[1:].lower()}={value}")
+                if meta_bits:
+                    lines.append("metadata=" + ", ".join(meta_bits))
+
+            previews: list[str] = []
+            for idx, page in enumerate(reader.pages[:3]):
+                text = (page.extract_text() or "").strip()
+                if text:
+                    previews.append(f"page_{idx}_preview={text[:240]}")
+            if previews:
+                lines.extend(previews)
+            return ToolResult(ok=True, content="\n".join(lines))
 
         if action == "extract_text":
             raw_path = str(args.get("path") or "").strip()
@@ -146,10 +198,7 @@ class PdfTool(BaseTool):
                 if page < 0 or page >= len(reader.pages):
                     return ToolResult(ok=False, content=f"page out of range: {page}")
                 text = reader.pages[page].extract_text() or ""
-                return ToolResult(
-                    ok=True,
-                    content=f"PDF text extracted.\npath={file_path}\npage={page}\n\n{text[:12000]}",
-                )
+                return ToolResult(ok=True, content=f"PDF text extracted.\npath={file_path}\npage={page}\n\n{text[:12000]}")
             chunks: list[str] = []
             for idx, pdf_page in enumerate(reader.pages):
                 text = pdf_page.extract_text() or ""
@@ -179,10 +228,7 @@ class PdfTool(BaseTool):
             if not args.get("confirmed"):
                 return ToolResult(
                     ok=False,
-                    content=self._write_preview(
-                        action,
-                        [f"output_path={output_path}", f"input_count={len(input_paths)}"],
-                    ),
+                    content=self._write_preview(action, [f"output_path={output_path}", f"input_count={len(input_paths)}"]),
                     requires_confirmation=True,
                     risk_level="high",
                     proposed_action={"action": action, **args},
@@ -211,6 +257,10 @@ class PdfTool(BaseTool):
             page = args.get("page")
             if not isinstance(page, int):
                 return ToolResult(ok=False, content="page is required for edit_page_nl")
+            page_index_mode = str(args.get("page_index_mode") or "auto").strip().lower() or "auto"
+            if page_index_mode not in {"auto", "zero_based", "one_based"}:
+                return ToolResult(ok=False, content=f"unsupported page_index_mode: {page_index_mode}")
+
             raw_output = str(args.get("output_path") or raw_path).strip()
             try:
                 input_path = self._resolve_workspace_path(raw_path)
@@ -230,6 +280,7 @@ class PdfTool(BaseTool):
                             f"input_path={input_path}",
                             f"output_path={output_path}",
                             f"page={page}",
+                            f"page_index_mode={page_index_mode}",
                         ],
                     ),
                     requires_confirmation=True,
@@ -241,20 +292,33 @@ class PdfTool(BaseTool):
             if output_path.resolve() != input_path.resolve():
                 shutil.copy2(input_path, output_path)
 
-            cmd = ["nano-pdf", "edit", str(output_path), str(page), instruction]
-            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            if proc.returncode != 0:
-                stderr = (proc.stderr or proc.stdout or "").strip()
-                return ToolResult(ok=False, content=f"nano-pdf edit failed: {stderr or 'unknown error'}")
+            attempts = self._candidate_pages(page, page_index_mode)
+            errors: list[str] = []
+            for candidate in attempts:
+                if candidate < 0:
+                    continue
+                cmd = ["nano-pdf", "edit", str(output_path), str(candidate), instruction]
+                proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    stderr = (proc.stderr or proc.stdout or "").strip()
+                    errors.append(f"page={candidate}: {stderr or 'unknown error'}")
+                    continue
+                if not self._verify_pdf(output_path):
+                    errors.append(f"page={candidate}: output validation failed")
+                    continue
+                return ToolResult(
+                    ok=True,
+                    content=(
+                        "PDF page edit complete.\n"
+                        f"output_path={output_path}\n"
+                        f"requested_page={page}\n"
+                        f"applied_page_index={candidate}\n"
+                        f"page_index_mode={page_index_mode}"
+                    ),
+                    artifacts=[self._artifact(output_path)],
+                )
 
-            return ToolResult(
-                ok=True,
-                content=(
-                    "PDF page edit complete.\n"
-                    f"output_path={output_path}\n"
-                    f"page={page}"
-                ),
-                artifacts=[self._artifact(output_path)],
-            )
+            details = "; ".join(errors) if errors else "unknown error"
+            return ToolResult(ok=False, content=f"nano-pdf edit failed: {details}")
 
         return ToolResult(ok=False, content=f"Unsupported action: {action}")

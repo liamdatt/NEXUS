@@ -238,3 +238,46 @@ def test_bridge_client_handles_bridge_diagnostic_events_without_crash(tmp_path: 
     assert "BridgeClient received bridge.connected" in caplog.text
     assert "BridgeClient received bridge.disconnected" in caplog.text
     assert "pairing_timeout_waiting_for_qr" in caplog.text
+
+
+def test_bridge_client_continues_when_on_inbound_raises(tmp_path: Path, caplog):
+    settings = Settings(
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+    )
+
+    seen = {"calls": 0}
+
+    async def on_inbound(_msg, _trace_id):  # noqa: ANN001
+        seen["calls"] += 1
+        raise RuntimeError("boom")
+
+    client = BridgeClient(settings=settings, on_inbound=on_inbound)
+
+    inbound_env = json.dumps(
+        {
+            "event": "bridge.inbound_message",
+            "message_id": "m1",
+            "timestamp": "2026-02-09T00:00:00Z",
+            "channel": "whatsapp",
+            "trace_id": "t1",
+            "payload": [
+                {
+                    "id": "in-1",
+                    "chat_id": "123@lid",
+                    "sender_id": "123@lid",
+                    "is_self_chat": True,
+                    "is_from_me": True,
+                    "text": "hello",
+                    "timestamp": "2026-02-09T00:00:00Z",
+                }
+            ],
+        }
+    )
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(client._handle_message(inbound_env))
+
+    assert seen["calls"] == 1
+    assert "BridgeClient inbound handler error" in caplog.text

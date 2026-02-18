@@ -46,6 +46,9 @@ class Settings(BaseSettings):
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    excel_recalc_enabled: bool = True
+    excel_recalc_timeout_seconds: int = 45
+    excel_strict_formula_errors: bool = True
 
     brave_api_key: str = ""
     timezone: str = "America/Los_Angeles"
