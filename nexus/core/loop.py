@@ -13,6 +13,7 @@ from nexus.config import Settings
 from nexus.core.decision import AgentDecision, DecisionParseError, parse_agent_decision
 from nexus.core.policy import PolicyEngine
 from nexus.core.protocol import InboundMessage, OutboundMessage
+from nexus.core.text_format import format_whatsapp_text
 from nexus.db.models import Database
 from nexus.llm.context import ContextBuilder
 from nexus.llm.router import LLMRouter
@@ -337,8 +338,27 @@ class NexusLoop:
         }
         return prepared, inference, None
 
-    async def _send_tool_result(self, inbound: InboundMessage, result: ToolResult) -> None:
+    def _format_outbound_text(self, *, channel: str, text: str, trace_id: str | None = None) -> str:
+        if channel != "whatsapp":
+            return text
+        formatted = format_whatsapp_text(text)
+        if formatted != text:
+            self.db.insert_audit(
+                trace_id=trace_id or str(uuid4()),
+                event="outbound.format.applied",
+                payload={
+                    "channel": channel,
+                    "before_len": len(text),
+                    "after_len": len(formatted),
+                },
+            )
+        return formatted
+
+    async def _send_tool_result(self, inbound: InboundMessage, result: ToolResult, trace_id: str | None = None) -> None:
         safe_content = self._redact(result.content or "").strip()
+        if not safe_content:
+            safe_content = "Task completed, but there was no textual output."
+        safe_content = self._format_outbound_text(channel=inbound.channel, text=safe_content, trace_id=trace_id).strip()
         if not safe_content:
             safe_content = "Task completed, but there was no textual output."
 
@@ -360,12 +380,17 @@ class NexusLoop:
         )
         await self._send(out)
 
-    async def _send_text(self, inbound: InboundMessage, text: str) -> None:
+    async def _send_text(self, inbound: InboundMessage, text: str, trace_id: str | None = None) -> None:
+        safe_text = self._format_outbound_text(channel=inbound.channel, text=text, trace_id=trace_id).strip()
+        if not safe_text:
+            safe_text = self._redact(text).strip()
+        if not safe_text:
+            safe_text = "Task completed, but there was no textual output."
         out = OutboundMessage(
             id=str(uuid4()),
             channel=inbound.channel,
             chat_id=inbound.chat_id,
-            text=text,
+            text=safe_text,
             reply_to=inbound.id,
         )
         await self._send(out)
@@ -457,6 +482,7 @@ class NexusLoop:
         tool_name: str,
         risk_level: str,
         args: dict[str, Any],
+        trace_id: str | None = None,
     ) -> None:
         pending = self.policy.create_pending_action(
             chat_id=inbound.chat_id,
@@ -470,6 +496,7 @@ class NexusLoop:
                 f"Confirmation required for {tool_name} ({risk_level}). "
                 f"Reply YES to proceed or NO to cancel. Action ID: {pending.action_id}"
             ),
+            trace_id=trace_id,
         )
 
     def _format_observation(self, result: ToolResult) -> str:
@@ -510,7 +537,7 @@ class NexusLoop:
                 event="tool.attachment_inference_missing",
                 payload={"tool": tool_name, "chat_id": inbound.chat_id},
             )
-            await self._send_text(inbound, inference_error)
+            await self._send_text(inbound, inference_error, trace_id=trace_id)
             return
         if inferred_attachment:
             self.db.insert_audit(
@@ -525,6 +552,7 @@ class NexusLoop:
                 tool_name=tool_name,
                 risk_level=result.risk_level,
                 args={**prepared_args, "chat_id": inbound.chat_id},
+                trace_id=trace_id,
             )
             return
 
@@ -535,7 +563,7 @@ class NexusLoop:
                 event="tool.artifacts_recorded",
                 payload={"tool": tool_name, "count": len(recorded), "chat_id": inbound.chat_id},
             )
-        await self._send_tool_result(inbound, result)
+        await self._send_tool_result(inbound, result, trace_id=trace_id)
         self.db.insert_audit(trace_id=trace_id, event="tool.execute", payload={"tool": tool_name, "ok": result.ok})
         self.journals.append_event(f"tool={tool_name} ok={result.ok} chat_id={inbound.chat_id}")
 
@@ -601,7 +629,7 @@ class NexusLoop:
                     event="loop.step",
                     payload={"step": step, "ok": True, "action": "response"},
                 )
-                await self._send_text(inbound, self._redact(decision.response))
+                await self._send_text(inbound, self._redact(decision.response), trace_id=trace_id)
                 self.journals.append_event(f"response chat_id={inbound.chat_id}")
                 return
 
@@ -622,7 +650,7 @@ class NexusLoop:
                     event="tool.attachment_inference_missing",
                     payload={"tool": tool_name, "chat_id": inbound.chat_id, "step": step},
                 )
-                await self._send_text(inbound, inference_error)
+                await self._send_text(inbound, inference_error, trace_id=trace_id)
                 return
             if inferred_attachment:
                 self.db.insert_audit(
@@ -642,6 +670,7 @@ class NexusLoop:
                     tool_name=tool_name,
                     risk_level=result.risk_level,
                     args={**prepared_args, "chat_id": inbound.chat_id},
+                    trace_id=trace_id,
                 )
                 return
 
@@ -658,7 +687,7 @@ class NexusLoop:
                     payload={"tool": tool_name, "step": step, "count": len(recorded), "chat_id": inbound.chat_id},
                 )
             if result.artifacts:
-                await self._send_tool_result(inbound, result)
+                await self._send_tool_result(inbound, result, trace_id=trace_id)
             observation = self._format_observation(result)
             self.db.insert_audit(
                 trace_id=trace_id,
@@ -689,6 +718,7 @@ class NexusLoop:
         await self._send_text(
             inbound,
             "I reached the maximum reasoning steps for this request. Please narrow the task or ask me to continue from a specific point.",
+            trace_id=trace_id,
         )
 
     async def handle_inbound(self, inbound: InboundMessage, trace_id: str) -> None:
@@ -774,7 +804,7 @@ class NexusLoop:
                             confirmed=True,
                         )
                     else:
-                        await self._send_text(inbound, "Cancelled pending action.")
+                        await self._send_text(inbound, "Cancelled pending action.", trace_id=trace_id)
                     return
 
             direct = self._parse_tool_command(raw_text)
@@ -787,7 +817,7 @@ class NexusLoop:
                     return
                 if direct.get("type") == "response":
                     response = str(direct.get("text") or "")
-                    await self._send_text(inbound, self._redact(response))
+                    await self._send_text(inbound, self._redact(response), trace_id=trace_id)
                     self.journals.append_event(f"response chat_id={inbound.chat_id}")
                     return
 
@@ -821,7 +851,7 @@ class NexusLoop:
 
             fallback = "I hit an internal processing error while handling that request. Please try again."
             try:
-                await self._send_text(inbound, fallback)
+                await self._send_text(inbound, fallback, trace_id=trace_id)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "Failed to send inbound error reply id=%s chat_id=%s trace_id=%s",

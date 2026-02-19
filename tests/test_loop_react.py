@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,16 @@ class _EchoTool(BaseTool):
                     }
                 ],
             )
+        if action == "markdown":
+            return ToolResult(
+                ok=True,
+                content=(
+                    "## Summary\n\n"
+                    "* Item one\n"
+                    "•\u2060  \u200bItem two\n"
+                    "[Details](https://example.com)"
+                ),
+            )
         if action == "explode":
             raise RuntimeError("boom")
         return ToolResult(ok=True, content=f"obs:{action or 'none'}")
@@ -102,6 +113,19 @@ def _inbound(msg_id: str, text: str = "run task") -> InboundMessage:
         channel="whatsapp",
         chat_id="self@lid",
         sender_id="self@lid",
+        is_self_chat=True,
+        is_from_me=True,
+        text=text,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+def _inbound_cli(msg_id: str, text: str = "run task") -> InboundMessage:
+    return InboundMessage(
+        id=msg_id,
+        channel="cli",
+        chat_id="cli-user",
+        sender_id="cli-user",
         is_self_chat=True,
         is_from_me=True,
         text=text,
@@ -227,6 +251,59 @@ def test_react_thought_is_not_user_visible_or_persisted(tmp_path: Path):
     if log_path.exists():
         content = log_path.read_text(encoding="utf-8")
         assert "SECRET_THOUGHT_SHOULD_NOT_LEAK" not in content
+
+
+def test_whatsapp_response_is_formatted_before_send(tmp_path: Path):
+    llm = _SequenceLLM(
+        [
+            '{"thought":"format","response":"## Headlines\\n\\n* Item one\\n•\\u2060  \\u200bItem two\\n[Read](https://example.com)"}'
+        ]
+    )
+    loop, sent, _db, settings = _build_loop(tmp_path, llm)
+
+    asyncio.run(loop.handle_inbound(_inbound("react-format-wa"), trace_id="t-react-format-wa"))
+
+    assert len(sent) == 1
+    text = getattr(sent[0], "text", "") or ""
+    assert "## Headlines" not in text
+    assert "•" not in text
+    assert "*Headlines*" in text
+    assert "- Item one" in text
+    assert "- Item two" in text
+    assert "Read (https://example.com)" in text
+    events = _audit_events(settings.db_path)
+    assert "outbound.format.applied" in events
+
+
+def test_cli_response_is_not_formatted(tmp_path: Path):
+    raw = "## Headlines\n\n* Item one\n[Read](https://example.com)"
+    llm = _SequenceLLM([json.dumps({"thought": "format", "response": raw})])
+    loop, sent, _db, settings = _build_loop(tmp_path, llm)
+
+    asyncio.run(loop.handle_inbound(_inbound_cli("react-format-cli"), trace_id="t-react-format-cli"))
+
+    assert len(sent) == 1
+    assert sent[0] == raw
+    events = _audit_events(settings.db_path)
+    assert "outbound.format.applied" not in events
+
+
+def test_tool_result_text_is_formatted_for_whatsapp(tmp_path: Path):
+    llm = _SequenceLLM(['{"thought":"unused","response":"ok"}'])
+    loop, sent, _db, settings = _build_loop(tmp_path, llm)
+
+    inbound = _inbound("react-tool-format", text='/tool echo {"action":"markdown"}')
+    asyncio.run(loop.handle_inbound(inbound, trace_id="t-react-tool-format"))
+
+    assert len(sent) == 1
+    text = getattr(sent[0], "text", "") or ""
+    assert "## Summary" not in text
+    assert "*Summary*" in text
+    assert "- Item one" in text
+    assert "- Item two" in text
+    assert "Details (https://example.com)" in text
+    events = _audit_events(settings.db_path)
+    assert "outbound.format.applied" in events
 
 
 def test_direct_tool_artifact_is_sent_as_attachment(tmp_path: Path):
