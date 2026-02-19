@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,8 @@ from nexus.tools.base import ToolRegistry, ToolResult
 
 
 logger = logging.getLogger(__name__)
+_ARTIFACT_RETENTION_SECONDS = 2 * 60 * 60
+_ARTIFACT_MAX_PER_CHAT = 20
 
 
 def _normalize_wa_identity(value: str) -> str:
@@ -71,6 +74,9 @@ class NexusLoop:
         self.redacted_log_path = settings.db_path.parent / "redacted.log"
         self._send_whatsapp = None
         self._send_cli = None
+        self._recent_artifacts: dict[str, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=_ARTIFACT_MAX_PER_CHAT)
+        )
 
     def bind_channels(self, send_whatsapp, send_cli) -> None:
         self._send_whatsapp = send_whatsapp
@@ -166,6 +172,170 @@ class NexusLoop:
                 payload["caption"] = caption
             out.append(payload)
         return out
+
+    def _is_workspace_file(self, path: Path) -> bool:
+        workspace = self.settings.workspace.resolve()
+        resolved = path.resolve()
+        return resolved == workspace or workspace in resolved.parents
+
+    def _workspace_relative(self, path: Path) -> str:
+        workspace = self.settings.workspace.resolve()
+        resolved = path.resolve()
+        try:
+            return str(resolved.relative_to(workspace))
+        except ValueError:
+            return resolved.name
+
+    def _prune_recent_artifacts(self, chat_id: str) -> None:
+        entries = self._recent_artifacts.get(chat_id)
+        if not entries:
+            return
+        now = datetime.now(timezone.utc)
+        kept: deque[dict[str, Any]] = deque(maxlen=_ARTIFACT_MAX_PER_CHAT)
+        for item in entries:
+            raw_path = str(item.get("path") or "").strip()
+            created_at = str(item.get("created_at") or "").strip()
+            if not raw_path or not created_at:
+                continue
+            try:
+                created = datetime.fromisoformat(created_at)
+            except ValueError:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if now - created > timedelta(seconds=_ARTIFACT_RETENTION_SECONDS):
+                continue
+            file_path = Path(raw_path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            kept.append(item)
+        self._recent_artifacts[chat_id] = kept
+
+    def _record_recent_artifacts(self, chat_id: str, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not artifacts:
+            return []
+        self._prune_recent_artifacts(chat_id)
+        entries = self._recent_artifacts[chat_id]
+        created_at = datetime.now(timezone.utc).isoformat()
+        added: list[dict[str, Any]] = []
+        for item in artifacts:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            file_path = Path(raw_path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            entry = {
+                "type": str(item.get("type") or ""),
+                "path": str(file_path),
+                "relative_path": self._workspace_relative(file_path),
+                "file_name": str(item.get("file_name") or file_path.name),
+                "mime_type": str(item.get("mime_type") or ""),
+                "created_at": created_at,
+            }
+            entries.append(entry)
+            added.append(entry)
+
+        if added:
+            lines = [
+                (
+                    f"- file_name={entry['file_name']} relative_path={entry['relative_path']} "
+                    f"path={entry['path']} mime_type={entry['mime_type'] or '-'}"
+                )
+                for entry in added
+            ]
+            note = "[ARTIFACT_MEMORY]\n" + "\n".join(lines) + "\n[/ARTIFACT_MEMORY]"
+            self.memory.append_turn(chat_id, "assistant", note)
+        return added
+
+    def _latest_recent_artifact(self, chat_id: str) -> dict[str, Any] | None:
+        self._prune_recent_artifacts(chat_id)
+        entries = self._recent_artifacts.get(chat_id)
+        if not entries:
+            return None
+        for item in reversed(entries):
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            file_path = Path(raw_path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            if not self._is_workspace_file(file_path):
+                continue
+            return item
+        return None
+
+    @staticmethod
+    def _wants_deictic_attachment(text: str) -> bool:
+        lowered = text.strip().lower()
+        if not lowered:
+            return False
+        has_pointer = any(token in lowered for token in ("this", "that", "latest", "generated"))
+        has_file_intent = any(
+            token in lowered
+            for token in (
+                "image",
+                "file",
+                "pdf",
+                "sheet",
+                "spreadsheet",
+                "attachment",
+                "attach",
+                "document",
+            )
+        )
+        if has_pointer and has_file_intent:
+            return True
+        return "send this" in lowered and "email" in lowered
+
+    def _prepare_tool_args(
+        self,
+        inbound: InboundMessage,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+        prepared = {**args}
+        if tool_name != "email":
+            return prepared, None, None
+
+        action = str(prepared.get("action") or "").strip()
+        if action not in {"send_email", "create_draft", "reply"}:
+            return prepared, None, None
+        if prepared.get("attachments"):
+            return prepared, None, None
+
+        text = inbound.text or ""
+        if not self._wants_deictic_attachment(text):
+            return prepared, None, None
+
+        latest = self._latest_recent_artifact(inbound.chat_id)
+        if latest is None:
+            return (
+                prepared,
+                None,
+                (
+                    "I couldn't find a recent generated file to attach. "
+                    "Please provide an attachment path inside the workspace, for example "
+                    "`generated/images/your-file.png`."
+                ),
+            )
+
+        prepared["attachments"] = [
+            {
+                "path": latest["path"],
+                "file_name": latest["file_name"],
+                "mime_type": latest.get("mime_type") or "",
+            }
+        ]
+        inference = {
+            "source": "latest_chat_artifact",
+            "file_name": latest["file_name"],
+            "path": latest["path"],
+            "relative_path": latest.get("relative_path") or "",
+        }
+        return prepared, inference, None
 
     async def _send_tool_result(self, inbound: InboundMessage, result: ToolResult) -> None:
         safe_content = self._redact(result.content or "").strip()
@@ -333,16 +503,38 @@ class NexusLoop:
         trace_id: str,
         confirmed: bool = False,
     ) -> None:
-        result = await self._invoke_tool(inbound, tool_name, args, confirmed=confirmed)
+        prepared_args, inferred_attachment, inference_error = self._prepare_tool_args(inbound, tool_name, args)
+        if inference_error:
+            self.db.insert_audit(
+                trace_id=trace_id,
+                event="tool.attachment_inference_missing",
+                payload={"tool": tool_name, "chat_id": inbound.chat_id},
+            )
+            await self._send_text(inbound, inference_error)
+            return
+        if inferred_attachment:
+            self.db.insert_audit(
+                trace_id=trace_id,
+                event="tool.attachment_inferred",
+                payload={"tool": tool_name, "chat_id": inbound.chat_id, "attachment": inferred_attachment},
+            )
+        result = await self._invoke_tool(inbound, tool_name, prepared_args, confirmed=confirmed)
         if result.requires_confirmation:
             await self._request_confirmation(
                 inbound,
                 tool_name=tool_name,
                 risk_level=result.risk_level,
-                args={**args, "chat_id": inbound.chat_id},
+                args={**prepared_args, "chat_id": inbound.chat_id},
             )
             return
 
+        recorded = self._record_recent_artifacts(inbound.chat_id, result.artifacts)
+        if recorded:
+            self.db.insert_audit(
+                trace_id=trace_id,
+                event="tool.artifacts_recorded",
+                payload={"tool": tool_name, "count": len(recorded), "chat_id": inbound.chat_id},
+            )
         await self._send_tool_result(inbound, result)
         self.db.insert_audit(trace_id=trace_id, event="tool.execute", payload={"tool": tool_name, "ok": result.ok})
         self.journals.append_event(f"tool={tool_name} ok={result.ok} chat_id={inbound.chat_id}")
@@ -423,13 +615,33 @@ class NexusLoop:
                 payload={"step": step, "ok": True, "action": "call", "tool": tool_name},
             )
 
-            result = await self._invoke_tool(inbound, tool_name, tool_args)
+            prepared_args, inferred_attachment, inference_error = self._prepare_tool_args(inbound, tool_name, tool_args)
+            if inference_error:
+                self.db.insert_audit(
+                    trace_id=trace_id,
+                    event="tool.attachment_inference_missing",
+                    payload={"tool": tool_name, "chat_id": inbound.chat_id, "step": step},
+                )
+                await self._send_text(inbound, inference_error)
+                return
+            if inferred_attachment:
+                self.db.insert_audit(
+                    trace_id=trace_id,
+                    event="tool.attachment_inferred",
+                    payload={
+                        "tool": tool_name,
+                        "chat_id": inbound.chat_id,
+                        "step": step,
+                        "attachment": inferred_attachment,
+                    },
+                )
+            result = await self._invoke_tool(inbound, tool_name, prepared_args)
             if result.requires_confirmation:
                 await self._request_confirmation(
                     inbound,
                     tool_name=tool_name,
                     risk_level=result.risk_level,
-                    args={**tool_args, "chat_id": inbound.chat_id},
+                    args={**prepared_args, "chat_id": inbound.chat_id},
                 )
                 return
 
@@ -438,6 +650,13 @@ class NexusLoop:
                 event="tool.execute",
                 payload={"tool": tool_name, "ok": result.ok},
             )
+            recorded = self._record_recent_artifacts(inbound.chat_id, result.artifacts)
+            if recorded:
+                self.db.insert_audit(
+                    trace_id=trace_id,
+                    event="tool.artifacts_recorded",
+                    payload={"tool": tool_name, "step": step, "count": len(recorded), "chat_id": inbound.chat_id},
+                )
             if result.artifacts:
                 await self._send_tool_result(inbound, result)
             observation = self._format_observation(result)
@@ -454,7 +673,7 @@ class NexusLoop:
                     "content": json.dumps(
                         {
                             "thought": decision.thought,
-                            "call": {"name": tool_name, "arguments": tool_args},
+                            "call": {"name": tool_name, "arguments": prepared_args},
                         },
                         ensure_ascii=False,
                     ),

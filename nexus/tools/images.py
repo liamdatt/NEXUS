@@ -52,6 +52,14 @@ class ImagesTool(BaseTool):
             raise PermissionError("path escapes workspace")
         return resolved
 
+    def _relative_path_for_display(self, raw_path: str) -> str:
+        path = Path(raw_path).expanduser().resolve()
+        workspace = self.settings.workspace.resolve()
+        try:
+            return str(path.relative_to(workspace))
+        except ValueError:
+            return str(path)
+
     @staticmethod
     def _to_path_list(value: Any) -> list[str]:
         if value is None:
@@ -178,8 +186,13 @@ class ImagesTool(BaseTool):
             return ToolResult(ok=False, content=f"image {action} failed: no images returned")
 
         summary = str(data.get("text") or "").strip()
-        files = ", ".join(item.get("file_name") or "image" for item in artifacts)
-        text = f"Image {action} complete. Files: {files}"
+        lines = [f"Image {action} complete."]
+        lines.append("Files:")
+        for item in artifacts:
+            file_name = item.get("file_name") or "image"
+            display_path = self._relative_path_for_display(str(item.get("path") or ""))
+            lines.append(f"- {file_name}: {display_path}")
+        text = "\n".join(lines)
         if summary:
             text += f"\n\n{summary[:1200]}"
 

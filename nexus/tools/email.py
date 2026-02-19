@@ -167,6 +167,14 @@ class EmailTool(BaseTool):
         preview_lines.append("Reply YES to proceed or NO to cancel.")
         return "\n".join(preview_lines)
 
+    @staticmethod
+    def _looks_like_basename(path_value: str) -> bool:
+        if not path_value:
+            return False
+        if "/" in path_value or "\\" in path_value:
+            return False
+        return not Path(path_value).is_absolute()
+
     def _normalize_attachments(self, raw_value: Any) -> tuple[list[dict[str, str]], str | None]:
         attachments = _to_attachment_candidates(raw_value)
         if not attachments:
@@ -181,10 +189,24 @@ class EmailTool(BaseTool):
             if not candidate.is_absolute():
                 candidate = workspace / candidate
             full = candidate.resolve()
+            if (not full.exists() or not full.is_file()) and self._looks_like_basename(raw_path):
+                matches = sorted(path.resolve() for path in workspace.rglob(raw_path) if path.is_file())
+                if len(matches) == 1:
+                    full = matches[0]
+                elif len(matches) > 1:
+                    options = [str(path.relative_to(workspace)) for path in matches[:6]]
+                    suffix = " ..." if len(matches) > 6 else ""
+                    return [], f"attachment filename is ambiguous; use one of: {', '.join(options)}{suffix}"
             if workspace != full and workspace not in full.parents:
                 return [], f"attachment path escapes workspace: {full}"
             if not full.exists() or not full.is_file():
-                return [], f"attachment file not found: {full}"
+                return (
+                    [],
+                    (
+                        f"attachment file not found: {full}. "
+                        "Use a workspace path like generated/images/file.png."
+                    ),
+                )
             payload = {
                 "path": str(full),
                 "file_name": str(item.get("file_name") or full.name),

@@ -63,6 +63,24 @@ class _EchoTool(BaseTool):
         return ToolResult(ok=True, content=f"obs:{action or 'none'}")
 
 
+class _EmailCaptureTool(BaseTool):
+    name = "email"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.name,
+            description="Email capture test tool",
+            input_schema={"type": "object", "properties": {"action": {"type": "string"}}},
+        )
+
+    async def run(self, args: dict[str, Any]) -> ToolResult:
+        self.calls.append(dict(args))
+        return ToolResult(ok=True, content="email queued")
+
+
 def _settings(tmp_path: Path, *, agent_max_steps: int = 20) -> Settings:
     prompts = tmp_path / "prompts"
     prompts.mkdir(parents=True, exist_ok=True)
@@ -91,7 +109,13 @@ def _inbound(msg_id: str, text: str = "run task") -> InboundMessage:
     )
 
 
-def _build_loop(tmp_path: Path, llm: _SequenceLLM, *, agent_max_steps: int = 20):
+def _build_loop(
+    tmp_path: Path,
+    llm: _SequenceLLM,
+    *,
+    agent_max_steps: int = 20,
+    extra_tools: list[BaseTool] | None = None,
+):
     settings = _settings(tmp_path, agent_max_steps=agent_max_steps)
     db = Database(settings.db_path)
     memory = MemoryStore(settings.memories_dir)
@@ -99,6 +123,8 @@ def _build_loop(tmp_path: Path, llm: _SequenceLLM, *, agent_max_steps: int = 20)
     policy = PolicyEngine(db)
     tools = ToolRegistry()
     tools.register(_EchoTool())
+    for tool in extra_tools or []:
+        tools.register(tool)
     loop = NexusLoop(settings, db, memory, journals, tools, policy, llm)
     sent: list[Any] = []
 
@@ -239,3 +265,55 @@ def test_inbound_exception_returns_safe_error_and_continues(tmp_path: Path):
     asyncio.run(loop.handle_inbound(follow_up, trace_id="t-react-follow-up"))
     assert len(sent) == 2
     assert "obs:a" in (getattr(sent[1], "text", "") or "")
+
+
+def test_email_attachment_inferred_from_latest_artifact(tmp_path: Path):
+    llm = _SequenceLLM(
+        [
+            '{"thought":"send email","call":{"name":"email","arguments":{"action":"send_email","to":["a@example.com"],"subject":"Dog image","body_text":"Hey here is that dog image"}}}',
+            '{"thought":"done","response":"sent"}',
+        ]
+    )
+    email_tool = _EmailCaptureTool()
+    loop, sent, db, settings = _build_loop(tmp_path, llm, extra_tools=[email_tool])
+
+    artifact = tmp_path / "workspace" / "generated" / "images" / "dog.png"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"png")
+
+    first = _inbound(
+        "react-artifact-seed",
+        text=f'/tool echo {{"action":"artifact","artifact_path":"{artifact}"}}',
+    )
+    asyncio.run(loop.handle_inbound(first, trace_id="t-react-seed"))
+
+    second = _inbound("react-email", text="Can you send this in an email to a@example.com?")
+    asyncio.run(loop.handle_inbound(second, trace_id="t-react-email"))
+
+    assert email_tool.calls
+    attachments = email_tool.calls[0].get("attachments")
+    assert isinstance(attachments, list) and attachments
+    assert attachments[0]["path"] == str(artifact.resolve())
+    events = _audit_events(settings.db_path)
+    assert "tool.attachment_inferred" in events
+    assert len(sent) == 2
+    assert getattr(sent[-1], "text", "") == "sent"
+
+
+def test_email_attachment_inference_missing_returns_guidance(tmp_path: Path):
+    llm = _SequenceLLM(
+        [
+            '{"thought":"send email","call":{"name":"email","arguments":{"action":"send_email","to":["a@example.com"],"subject":"Dog image","body_text":"Hey here is that dog image"}}}',
+        ]
+    )
+    email_tool = _EmailCaptureTool()
+    loop, sent, _db, settings = _build_loop(tmp_path, llm, extra_tools=[email_tool])
+
+    inbound = _inbound("react-email-missing", text="Send this in an email please.")
+    asyncio.run(loop.handle_inbound(inbound, trace_id="t-react-email-missing"))
+
+    assert len(sent) == 1
+    assert "couldn't find a recent generated file" in (getattr(sent[0], "text", "") or "").lower()
+    assert not email_tool.calls
+    events = _audit_events(settings.db_path)
+    assert "tool.attachment_inference_missing" in events

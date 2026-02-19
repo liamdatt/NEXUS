@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 
 from nexus.config import Settings
@@ -59,6 +60,7 @@ def test_pdf_merge(tmp_path: Path):
 def test_pdf_edit_page_nl_auto_fallback_page_index(monkeypatch, tmp_path: Path):
     tool = PdfTool(_settings(tmp_path))
     asyncio.run(tool.run({"action": "create", "path": "a.pdf", "text": "A", "confirmed": True}))
+    monkeypatch.setattr(PdfTool, "_nano_pdf_command_prefixes", staticmethod(lambda: [["nano-pdf"]]))
 
     calls: list[int] = []
 
@@ -91,6 +93,7 @@ def test_pdf_edit_page_nl_auto_fallback_page_index(monkeypatch, tmp_path: Path):
 def test_pdf_edit_page_nl_one_based_mode(monkeypatch, tmp_path: Path):
     tool = PdfTool(_settings(tmp_path))
     asyncio.run(tool.run({"action": "create", "path": "a.pdf", "text": "A", "confirmed": True}))
+    monkeypatch.setattr(PdfTool, "_nano_pdf_command_prefixes", staticmethod(lambda: [["nano-pdf"]]))
 
     calls: list[int] = []
 
@@ -114,3 +117,65 @@ def test_pdf_edit_page_nl_one_based_mode(monkeypatch, tmp_path: Path):
     )
     assert result.ok
     assert calls == [1]
+
+
+def test_pdf_edit_page_nl_dependency_missing_returns_clean_error(monkeypatch, tmp_path: Path):
+    tool = PdfTool(_settings(tmp_path))
+    asyncio.run(tool.run({"action": "create", "path": "a.pdf", "text": "A", "confirmed": True}))
+    monkeypatch.setattr(PdfTool, "_nano_pdf_command_prefixes", staticmethod(lambda: [["missing-nano-pdf"]]))
+
+    def fake_run(_cmd, check, capture_output, text):  # noqa: ANN001, ARG001
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr("nexus.tools.pdf.subprocess.run", fake_run)
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "edit_page_nl",
+                "path": "a.pdf",
+                "output_path": "edited.pdf",
+                "page": 1,
+                "instruction": "Change title",
+                "page_index_mode": "auto",
+                "confirmed": True,
+            }
+        )
+    )
+    assert not result.ok
+    assert "dependency is unavailable" in result.content
+
+
+def test_pdf_edit_page_nl_uses_module_fallback_when_cli_missing(monkeypatch, tmp_path: Path):
+    tool = PdfTool(_settings(tmp_path))
+    asyncio.run(tool.run({"action": "create", "path": "a.pdf", "text": "A", "confirmed": True}))
+    monkeypatch.setattr(
+        PdfTool,
+        "_nano_pdf_command_prefixes",
+        staticmethod(lambda: [["missing-nano-pdf"], [sys.executable, "-m", "nano_pdf"]]),
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check, capture_output, text):  # noqa: ANN001
+        calls.append(cmd)
+        if cmd[0] == "missing-nano-pdf":
+            raise FileNotFoundError("missing")
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("nexus.tools.pdf.subprocess.run", fake_run)
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "edit_page_nl",
+                "path": "a.pdf",
+                "output_path": "edited.pdf",
+                "page": 1,
+                "instruction": "Change title",
+                "page_index_mode": "auto",
+                "confirmed": True,
+            }
+        )
+    )
+    assert result.ok
+    assert any(call[0] == "missing-nano-pdf" for call in calls)
+    assert any(call[0] == sys.executable and call[1:3] == ["-m", "nano_pdf"] for call in calls)

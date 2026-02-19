@@ -149,3 +149,53 @@ def test_send_draft_executes_when_confirmed(tmp_path: Path):
     result = asyncio.run(tool.run({"action": "send_draft", "draft_id": "drf-1", "confirmed": True}))
     assert result.ok
     assert "Draft sent." in result.content
+
+
+def test_send_email_attachment_basename_resolves_unique_match(tmp_path: Path):
+    client = _FakeGmailClient()
+    tool = EmailTool(_settings(tmp_path), client=client)
+    attachment = tmp_path / "workspace" / "generated" / "images" / "dog.png"
+    attachment.parent.mkdir(parents=True, exist_ok=True)
+    attachment.write_bytes(b"dog")
+
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "send_email",
+                "to": ["a@example.com"],
+                "subject": "Image",
+                "body_text": "Attached",
+                "attachments": ["dog.png"],
+                "confirmed": True,
+            }
+        )
+    )
+    assert result.ok
+    assert client.sent_payload is not None
+    assert client.sent_payload["attachments"][0]["path"] == str(attachment.resolve())
+
+
+def test_send_email_attachment_basename_ambiguous_returns_error(tmp_path: Path):
+    client = _FakeGmailClient()
+    tool = EmailTool(_settings(tmp_path), client=client)
+    first = tmp_path / "workspace" / "generated" / "images" / "dog.png"
+    second = tmp_path / "workspace" / "exports" / "dog.png"
+    first.parent.mkdir(parents=True, exist_ok=True)
+    second.parent.mkdir(parents=True, exist_ok=True)
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "send_email",
+                "to": ["a@example.com"],
+                "subject": "Image",
+                "body_text": "Attached",
+                "attachments": ["dog.png"],
+                "confirmed": True,
+            }
+        )
+    )
+    assert not result.ok
+    assert "ambiguous" in result.content.lower()

@@ -8,9 +8,15 @@ from nexus.tools.images import ImagesTool
 
 
 class _FakeImageClient:
-    def __init__(self) -> None:
+    def __init__(self, workspace: Path | None = None) -> None:
+        self.workspace = workspace
         self.last_generate: dict[str, object] | None = None
         self.last_edit: dict[str, object] | None = None
+
+    def _path(self, file_name: str) -> str:
+        if self.workspace is None:
+            return str(Path("/tmp") / file_name)
+        return str(self.workspace / "generated" / "images" / file_name)
 
     def generate(
         self,
@@ -32,7 +38,7 @@ class _FakeImageClient:
             "text": "generated",
             "artifacts": [
                 {
-                    "path": "/tmp/generated.png",
+                    "path": self._path("generated.png"),
                     "file_name": "generated.png",
                     "mime_type": "image/png",
                 }
@@ -61,7 +67,7 @@ class _FakeImageClient:
             "text": "edited",
             "artifacts": [
                 {
-                    "path": "/tmp/edited.png",
+                    "path": self._path("edited.png"),
                     "file_name": "edited.png",
                     "mime_type": "image/png",
                 }
@@ -79,14 +85,14 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def test_images_generate_requires_confirmation(tmp_path: Path):
-    tool = ImagesTool(_settings(tmp_path), client=_FakeImageClient())
+    tool = ImagesTool(_settings(tmp_path), client=_FakeImageClient(tmp_path / "workspace"))
     result = asyncio.run(tool.run({"action": "generate", "prompt": "sunset"}))
     assert not result.ok
     assert result.requires_confirmation
 
 
 def test_images_generate_when_confirmed_with_controls(tmp_path: Path):
-    client = _FakeImageClient()
+    client = _FakeImageClient(tmp_path / "workspace")
     tool = ImagesTool(_settings(tmp_path), client=client)
     result = asyncio.run(
         tool.run(
@@ -107,10 +113,11 @@ def test_images_generate_when_confirmed_with_controls(tmp_path: Path):
     assert client.last_generate["size"] == "1024x1024"
     assert client.last_generate["resolution"] == "2K"
     assert client.last_generate["output_path"] == "out/generated.png"
+    assert "generated/images/generated.png" in result.content
 
 
 def test_images_edit_requires_input_paths(tmp_path: Path):
-    tool = ImagesTool(_settings(tmp_path), client=_FakeImageClient())
+    tool = ImagesTool(_settings(tmp_path), client=_FakeImageClient(tmp_path / "workspace"))
     result = asyncio.run(tool.run({"action": "edit", "prompt": "make it blue", "confirmed": True}))
     assert not result.ok
 
@@ -120,7 +127,7 @@ def test_images_edit_when_confirmed(tmp_path: Path):
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"abc")
 
-    client = _FakeImageClient()
+    client = _FakeImageClient(tmp_path / "workspace")
     tool = ImagesTool(_settings(tmp_path), client=client)
     result = asyncio.run(
         tool.run(
@@ -140,3 +147,4 @@ def test_images_edit_when_confirmed(tmp_path: Path):
     assert client.last_edit["size"] == "1344x768"
     assert client.last_edit["resolution"] == "1K"
     assert client.last_edit["output_path"] == "out/edited.png"
+    assert "generated/images/edited.png" in result.content

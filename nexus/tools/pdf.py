@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,25 @@ class PdfTool(BaseTool):
             if candidate >= 0 and candidate not in candidates:
                 candidates.append(candidate)
         return candidates
+
+    @staticmethod
+    def _nano_pdf_command_prefixes() -> list[list[str]]:
+        prefixes: list[list[str]] = []
+        cli = shutil.which("nano-pdf")
+        if cli:
+            prefixes.append([cli])
+        prefixes.append([sys.executable, "-m", "nano_pdf"])
+        prefixes.append([sys.executable, "-m", "nano_pdf.cli"])
+
+        deduped: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for prefix in prefixes:
+            key = tuple(prefix)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(prefix)
+        return deduped
 
     async def run(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "")
@@ -294,30 +314,54 @@ class PdfTool(BaseTool):
 
             attempts = self._candidate_pages(page, page_index_mode)
             errors: list[str] = []
+            missing_dependency = True
+            module_missing_error = False
+            non_dependency_error = False
+            command_prefixes = self._nano_pdf_command_prefixes()
             for candidate in attempts:
                 if candidate < 0:
                     continue
-                cmd = ["nano-pdf", "edit", str(output_path), str(candidate), instruction]
-                proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-                if proc.returncode != 0:
-                    stderr = (proc.stderr or proc.stdout or "").strip()
-                    errors.append(f"page={candidate}: {stderr or 'unknown error'}")
-                    continue
-                if not self._verify_pdf(output_path):
-                    errors.append(f"page={candidate}: output validation failed")
-                    continue
-                return ToolResult(
-                    ok=True,
-                    content=(
-                        "PDF page edit complete.\n"
-                        f"output_path={output_path}\n"
-                        f"requested_page={page}\n"
-                        f"applied_page_index={candidate}\n"
-                        f"page_index_mode={page_index_mode}"
-                    ),
-                    artifacts=[self._artifact(output_path)],
-                )
+                for command_prefix in command_prefixes:
+                    cmd = [*command_prefix, "edit", str(output_path), str(candidate), instruction]
+                    try:
+                        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                    except FileNotFoundError as exc:
+                        errors.append(f"page={candidate}: dependency not found ({' '.join(command_prefix)})")
+                        continue
+                    missing_dependency = False
+                    if proc.returncode != 0:
+                        stderr = (proc.stderr or proc.stdout or "").strip()
+                        lowered = stderr.lower()
+                        if "no module named" in lowered and "nano_pdf" in lowered:
+                            module_missing_error = True
+                        else:
+                            non_dependency_error = True
+                        errors.append(f"page={candidate}: {stderr or 'unknown error'}")
+                        continue
+                    if not self._verify_pdf(output_path):
+                        non_dependency_error = True
+                        errors.append(f"page={candidate}: output validation failed")
+                        continue
+                    return ToolResult(
+                        ok=True,
+                        content=(
+                            "PDF page edit complete.\n"
+                            f"output_path={output_path}\n"
+                            f"requested_page={page}\n"
+                            f"applied_page_index={candidate}\n"
+                            f"page_index_mode={page_index_mode}"
+                        ),
+                        artifacts=[self._artifact(output_path)],
+                    )
 
+            if missing_dependency or (module_missing_error and not non_dependency_error):
+                return ToolResult(
+                    ok=False,
+                    content=(
+                        "PDF edit dependency is unavailable in runtime. "
+                        "Rebuild/deploy runtime image with nano-pdf."
+                    ),
+                )
             details = "; ".join(errors) if errors else "unknown error"
             return ToolResult(ok=False, content=f"nano-pdf edit failed: {details}")
 

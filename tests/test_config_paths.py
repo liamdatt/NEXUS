@@ -41,3 +41,35 @@ def test_env_precedence_os_then_cwd_then_home(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("NEXUS_OPENROUTER_API_KEY", "os-key")
     from_env = Settings(_env_file=(home_env, cwd_env))
     assert from_env.openrouter_api_key == "os-key"
+
+
+def test_nexus_model_alias_overrides_llm_models(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("NEXUS_MODEL", "moonshotai/kimi-k2.5")
+    settings = Settings(
+        _env_file=None,
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+        llm_primary_model="google/gemini-3-flash-preview",
+        llm_complex_model="anthropic/claude-sonnet-4.6",
+        llm_fallback_model="google/gemini-3-flash-preview",
+    )
+    assert settings.llm_primary_model == "moonshotai/kimi-k2.5"
+    assert settings.llm_complex_model == "moonshotai/kimi-k2.5"
+    assert settings.llm_fallback_model == "moonshotai/kimi-k2.5"
+
+
+def test_nexus_model_alias_unset_preserves_llm_models(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("NEXUS_MODEL", raising=False)
+    settings = Settings(
+        _env_file=None,
+        db_path=tmp_path / "nexus.db",
+        workspace=tmp_path / "workspace",
+        memories_dir=tmp_path / "memories",
+        llm_primary_model="google/gemini-3-flash-preview",
+        llm_complex_model="anthropic/claude-sonnet-4.6",
+        llm_fallback_model="moonshotai/kimi-k2.5",
+    )
+    assert settings.llm_primary_model == "google/gemini-3-flash-preview"
+    assert settings.llm_complex_model == "anthropic/claude-sonnet-4.6"
+    assert settings.llm_fallback_model == "moonshotai/kimi-k2.5"

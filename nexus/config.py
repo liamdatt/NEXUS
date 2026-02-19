@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from platformdirs import user_config_dir, user_data_dir
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     bridge_ws_url: str = "ws://127.0.0.1:8765"
     bridge_bind_host: str | None = None
     bridge_shared_secret: str = ""
+    model_override: str = Field(default="", validation_alias=AliasChoices("NEXUS_MODEL", "model_override"))
 
     llm_primary_model: str = "google/gemini-3-flash-preview"
     llm_complex_model: str = "google/gemini-3-flash-preview"
@@ -83,6 +84,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
+        model_override = self.model_override.strip()
+        if model_override:
+            self.llm_primary_model = model_override
+            self.llm_complex_model = model_override
+            self.llm_fallback_model = model_override
+
         self.config_dir = self.config_dir.expanduser().resolve()
         self.data_dir = self.data_dir.expanduser().resolve()
         if self.bridge_dir is not None:
