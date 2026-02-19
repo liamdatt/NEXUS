@@ -7,12 +7,35 @@ from pathlib import Path
 from typing import Any
 
 from fpdf import FPDF
+from fpdf.errors import FPDFUnicodeEncodingException
 from pypdf import PdfReader, PdfWriter
 
 from nexus.config import Settings
 from nexus.tools.base import BaseTool, ToolResult, ToolSpec
 
 PDF_MIME = "application/pdf"
+UNICODE_FONT_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+)
+LATIN1_REPLACEMENTS = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": ",",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+)
 
 
 def _to_path_list(value: Any) -> list[str]:
@@ -114,6 +137,57 @@ class PdfTool(BaseTool):
         return candidates
 
     @staticmethod
+    def _latin1_safe_text(text: str) -> str:
+        normalized = text.translate(LATIN1_REPLACEMENTS)
+        return normalized.encode("latin-1", errors="replace").decode("latin-1")
+
+    @staticmethod
+    def _build_pdf(*, title: str, text: str, unicode_enabled: bool) -> FPDF:
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        body = text
+        heading = title
+
+        if unicode_enabled:
+            regular_font = Path(UNICODE_FONT_CANDIDATES[0][0])
+            bold_font = Path(UNICODE_FONT_CANDIDATES[0][1])
+            for regular_candidate, bold_candidate in UNICODE_FONT_CANDIDATES:
+                regular_path = Path(regular_candidate)
+                bold_path = Path(bold_candidate)
+                if regular_path.exists():
+                    regular_font = regular_path
+                    bold_font = bold_path
+                    break
+            pdf.add_font("NexusSans", "", str(regular_font))
+            if bold_font.exists():
+                pdf.add_font("NexusSans", "B", str(bold_font))
+            pdf.set_font("NexusSans", size=12)
+        else:
+            heading = PdfTool._latin1_safe_text(title)
+            body = PdfTool._latin1_safe_text(text)
+            pdf.set_font("Helvetica", size=12)
+
+        if heading:
+            if unicode_enabled:
+                pdf.set_font("NexusSans", style="B", size=16)
+            else:
+                pdf.set_font("Helvetica", style="B", size=16)
+            pdf.multi_cell(0, 10, heading)
+            pdf.ln(2)
+            if unicode_enabled:
+                pdf.set_font("NexusSans", size=12)
+            else:
+                pdf.set_font("Helvetica", size=12)
+        pdf.multi_cell(0, 8, body)
+        return pdf
+
+    @staticmethod
+    def _unicode_font_available() -> bool:
+        return any(Path(regular).exists() for regular, _bold in UNICODE_FONT_CANDIDATES)
+
+    @staticmethod
     def _nano_pdf_command_prefixes() -> list[list[str]]:
         prefixes: list[list[str]] = []
         cli = shutil.which("nano-pdf")
@@ -156,17 +230,13 @@ class PdfTool(BaseTool):
                     proposed_action={"action": action, **args},
                 )
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=15)
-            pdf.add_page()
-            pdf.set_font("Helvetica", size=12)
-            if title:
-                pdf.set_font("Helvetica", style="B", size=16)
-                pdf.multi_cell(0, 10, title)
-                pdf.ln(2)
-                pdf.set_font("Helvetica", size=12)
-            pdf.multi_cell(0, 8, text)
-            pdf.output(str(file_path))
+            try:
+                pdf = self._build_pdf(title=title, text=text, unicode_enabled=self._unicode_font_available())
+                pdf.output(str(file_path))
+            except FPDFUnicodeEncodingException:
+                # Last-resort fallback: map unsupported glyphs to latin-1 safe text.
+                pdf = self._build_pdf(title=title, text=text, unicode_enabled=False)
+                pdf.output(str(file_path))
             return ToolResult(ok=True, content=f"PDF created.\npath={file_path}", artifacts=[self._artifact(file_path)])
 
         if action == "inspect":

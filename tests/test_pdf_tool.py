@@ -40,6 +40,29 @@ def test_pdf_create_and_extract_and_inspect(tmp_path: Path):
     assert "Hello world" in extracted.content or "Spec" in extracted.content
 
 
+def test_pdf_create_handles_unicode_punctuation_with_core_font_fallback(monkeypatch, tmp_path: Path):
+    tool = PdfTool(_settings(tmp_path))
+    monkeypatch.setattr(PdfTool, "_unicode_font_available", staticmethod(lambda: False))
+
+    created = asyncio.run(
+        tool.run(
+            {
+                "action": "create",
+                "path": "unicode.pdf",
+                "title": "Q1 status – draft",
+                "text": "Line one – line two.",
+                "confirmed": True,
+            }
+        )
+    )
+    assert created.ok
+
+    extracted = asyncio.run(tool.run({"action": "extract_text", "path": "unicode.pdf"}))
+    assert extracted.ok
+    assert "Q1 status" in extracted.content
+    assert "Line one" in extracted.content
+
+
 def test_pdf_merge(tmp_path: Path):
     tool = PdfTool(_settings(tmp_path))
     asyncio.run(tool.run({"action": "create", "path": "a.pdf", "text": "A", "confirmed": True}))
