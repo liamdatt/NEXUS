@@ -75,6 +75,34 @@ class _FakeImageClient:
         }
 
 
+class _FallbackImageClient(_FakeImageClient):
+    def __init__(self, workspace: Path | None = None) -> None:
+        super().__init__(workspace)
+        self.generate_models: list[str] = []
+
+    def generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size: str | None = None,
+        resolution: str | None = None,
+        output_path: str | None = None,
+    ):
+        self.generate_models.append(model)
+        if model == "moonshotai/kimi-k2.5":
+            raise RuntimeError(
+                'OpenRouter request failed (404): {"error":{"message":"No endpoints found for moonshotai/kimi-k2.5.","code":404}}'
+            )
+        return super().generate(
+            prompt=prompt,
+            model=model,
+            size=size,
+            resolution=resolution,
+            output_path=output_path,
+        )
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         db_path=tmp_path / "nexus.db",
@@ -148,3 +176,39 @@ def test_images_edit_when_confirmed(tmp_path: Path):
     assert client.last_edit["resolution"] == "1K"
     assert client.last_edit["output_path"] == "out/edited.png"
     assert "generated/images/edited.png" in result.content
+
+
+def test_images_generate_normalizes_legacy_model_alias(tmp_path: Path):
+    client = _FakeImageClient(tmp_path / "workspace")
+    tool = ImagesTool(_settings(tmp_path), client=client)
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "generate",
+                "prompt": "sunset",
+                "model": "google/gemini-2.0-flash-exp",
+                "confirmed": True,
+            }
+        )
+    )
+    assert result.ok
+    assert client.last_generate is not None
+    assert client.last_generate["model"] == "google/gemini-2.5-flash-image"
+
+
+def test_images_generate_retries_with_default_model_when_endpoint_missing(tmp_path: Path):
+    client = _FallbackImageClient(tmp_path / "workspace")
+    tool = ImagesTool(_settings(tmp_path), client=client)
+    result = asyncio.run(
+        tool.run(
+            {
+                "action": "generate",
+                "prompt": "sunset",
+                "model": "moonshotai/kimi-k2.5",
+                "confirmed": True,
+            }
+        )
+    )
+    assert result.ok
+    assert client.generate_models == ["moonshotai/kimi-k2.5", "google/gemini-2.5-flash-image"]
+    assert "Used `google/gemini-2.5-flash-image` instead." in result.content

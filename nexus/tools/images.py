@@ -8,6 +8,9 @@ from nexus.integrations.openrouter_images import OpenRouterImageClient
 from nexus.tools.base import BaseTool, ToolResult, ToolSpec
 
 DEFAULT_IMAGE_MODEL = "google/gemini-2.5-flash-image"
+LEGACY_IMAGE_MODEL_ALIASES = {
+    "google/gemini-2.5-flash-image": DEFAULT_IMAGE_MODEL,
+}
 
 
 class ImagesTool(BaseTool):
@@ -90,6 +93,21 @@ class ImagesTool(BaseTool):
         return [item for item in out if item.get("path")]
 
     @staticmethod
+    def _normalize_model(raw: str) -> str:
+        candidate = (raw or "").strip()
+        if not candidate:
+            return DEFAULT_IMAGE_MODEL
+        if candidate.startswith("openrouter/"):
+            candidate = candidate.split("/", 1)[1].strip()
+        normalized = LEGACY_IMAGE_MODEL_ALIASES.get(candidate.lower())
+        return normalized or candidate
+
+    @staticmethod
+    def _is_no_endpoint_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "no endpoints found for" in message
+
+    @staticmethod
     def _preview(
         action: str,
         model: str,
@@ -116,7 +134,7 @@ class ImagesTool(BaseTool):
     async def run(self, args: dict[str, Any]) -> ToolResult:
         action = str(args.get("action") or "")
         prompt = str(args.get("prompt") or "").strip()
-        model = str(args.get("model") or DEFAULT_IMAGE_MODEL).strip() or DEFAULT_IMAGE_MODEL
+        model = self._normalize_model(str(args.get("model") or DEFAULT_IMAGE_MODEL))
         size = str(args.get("size") or "").strip()
         resolution = str(args.get("resolution") or "").strip()
         output_path = str(args.get("output_path") or "").strip()
@@ -160,6 +178,8 @@ class ImagesTool(BaseTool):
                 proposed_action={"action": action, **args},
             )
 
+        fallback_notice = ""
+
         try:
             if action == "generate":
                 data = self.client.generate(
@@ -179,7 +199,34 @@ class ImagesTool(BaseTool):
                     output_path=output_path or None,
                 )
         except Exception as exc:  # noqa: BLE001
-            return ToolResult(ok=False, content=f"image {action} failed: {exc}")
+            if model != DEFAULT_IMAGE_MODEL and self._is_no_endpoint_error(exc):
+                try:
+                    if action == "generate":
+                        data = self.client.generate(
+                            prompt=prompt,
+                            model=DEFAULT_IMAGE_MODEL,
+                            size=size or None,
+                            resolution=resolution or None,
+                            output_path=output_path or None,
+                        )
+                    else:
+                        data = self.client.edit(
+                            prompt=prompt,
+                            input_paths=resolved_inputs,
+                            model=DEFAULT_IMAGE_MODEL,
+                            size=size or None,
+                            resolution=resolution or None,
+                            output_path=output_path or None,
+                        )
+                    fallback_notice = (
+                        f"Requested model `{model}` is unavailable on OpenRouter. "
+                        f"Used `{DEFAULT_IMAGE_MODEL}` instead."
+                    )
+                    model = DEFAULT_IMAGE_MODEL
+                except Exception as fallback_exc:  # noqa: BLE001
+                    return ToolResult(ok=False, content=f"image {action} failed: {fallback_exc}")
+            else:
+                return ToolResult(ok=False, content=f"image {action} failed: {exc}")
 
         artifacts = self._format_artifacts(data.get("artifacts") if isinstance(data, dict) else [])
         if not artifacts:
@@ -195,5 +242,7 @@ class ImagesTool(BaseTool):
         text = "\n".join(lines)
         if summary:
             text += f"\n\n{summary[:1200]}"
+        if fallback_notice:
+            text += f"\n\n{fallback_notice}"
 
         return ToolResult(ok=True, content=text, artifacts=artifacts)
